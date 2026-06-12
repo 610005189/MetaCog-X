@@ -1,27 +1,22 @@
 """runs/run_ab_v2.py
 
-3组 A/B 比较 v2:
-  1. gpt_plain            : enable_metacog=False
-  2. metacog_alwayson    : enable_metacog=True, 强制 _mode_state='metacog'
-                           + l1_gate last.bias=+5 -> sigmoid(+5)≈0.99 > enter_thresh=-1 永远 metacog
-  3. metacog_conditional : enable_metacog=True, 正常 L1 门控 + 滞后切换
-                           预训练 L1 gate：先 400 step plain CE backbone，
-                           再 entropy percentile 标注，BCE 训练 gate 500 step，
-                           然后再进入完整 conditional 训练 2000 step
+3 组 A/B 比较 v2 (纯 AdamW+CE, 500 steps):
+  1. gpt_plain        : enable_metacog=False
+  2. alwayson_meta   : enable_metacog=True, 强制 meta head 始终激活 (mode_state='metacog' + 极低 gate 阈值)
+  3. conditional_meta : enable_metacog=True, 正常 L1 gate + hysteresis
 
 tiny byte-level 模型 (ByteTokenizer, d_model=128, d_meta=32, d_aware=16,
   num_layers=4, num_heads=4, d_ffn=512, max_seq_len=64, vocab_size=260)
 
-8 主题 x 1200 句 -> ByteDataset(chunk 到 64 tokens)
+--quick 把 steps 缩到 10, val 缩到 32, 30 秒内跑完
 """
 
-import sys, os, math, random
+import sys, os, math, random, time, json, argparse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# CPU 并行：开足 8C16T 的 AMD 4750U
 os.environ.setdefault("OMP_NUM_THREADS", "16")
 os.environ.setdefault("MKL_NUM_THREADS", "16")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
@@ -33,7 +28,6 @@ from torch.utils.data import Dataset, DataLoader
 
 torch.set_float32_matmul_precision("high")
 
-# DirectML (AMD 核显) — 能导入就用
 try:
     import torch_directml
     DML_AVAIL = True
@@ -42,25 +36,14 @@ except Exception:
 
 from config import MetaCogXConfig
 from models import MetaCogXModel
-from models.dilemma_gate import attention_entropy, extract_features, logits_stats, token_repetition
 
 
 def pick_device():
     if torch.cuda.is_available():
         return "cuda"
-    # NOTE: torch-directml Adam optimizer lerp fallback + tiny d_model=128 make DML slower than CPU MKL.
-    # Force CPU for A/B evaluation (3x faster). Remove this override if model grows to d_model>=512.
-    # if DML_AVAIL:
-    #     try:
-    #         dev = torch_directml.device(0)
-    #         return dev
-    #     except Exception as e:
-    #         print("  [DML WARN] available but .device(0) failed: {}".format(e))
     return "cpu"
 
-# =========================================================
-# Byte-level Dataset
-# =========================================================
+
 PAD = 0
 SPECIAL = 4
 VOCAB = 256 + SPECIAL
@@ -127,19 +110,36 @@ def build_texts(n=1200, seed=42):
     return out
 
 
-# =========================================================
-# ppl 评估
-# =========================================================
-def evaluate_ppl(model, dl, device, use_metacog):
+def validate_ppl(model, dl, device, enable_metacog, mode="normal", collect_stats=False):
+    """返回 (avg_ce_loss, ppl, switches, plain_pct, score_mean, ctrl_std)"""
     model.eval()
+    model._switch_stats = {k: 0 for k in model._switch_stats} if hasattr(model, "_switch_stats") else {
+        "switches": 0, "total_forward": 0, "plain_steps": 0, "meta_steps": 0,
+    }
     total_loss = 0.0
     total_count = 0
+    switches = 0
+    plain_steps = 0
+    meta_steps = 0
+    dilemmas = []
+    abs_ctrls = []
+    n_batches = 0
     with torch.no_grad():
         for b in dl:
             ids = b["input_ids"].to(device)
             msk = b["attention_mask"].to(device)
-            o = model(ids, attention_mask=msk, enable_metacog=use_metacog)
-            lg = o["logits"][:, :-1, :]
+            if mode == "alwayson" and enable_metacog and hasattr(model, "l1_gate"):
+                model.l1_gate.enter_thresh = -1.0
+                model.l1_gate.exit_thresh = -1.0
+                model._mode_state = "metacog"
+                model._plain_countdown = 0
+                model._meta_countdown = 0
+                if hasattr(model.l1_gate, "net") and hasattr(model.l1_gate.net[3], "bias"):
+                    nn.init.constant_(model.l1_gate.net[3].bias, 5.0)
+            elif mode == "conditional" and enable_metacog and hasattr(model, "l1_gate"):
+                pass
+            out = model(ids, attention_mask=msk, enable_metacog=enable_metacog)
+            lg = out["logits"][:, :-1, :]
             tgt = ids[:, 1:]
             pm = msk[:, 1:].float()
             ce = F.cross_entropy(
@@ -150,235 +150,88 @@ def evaluate_ppl(model, dl, device, use_metacog):
             cnt = pm.sum()
             total_loss += float(loss.item())
             total_count += float(cnt.item())
+            ss = out.get("switch_stats", {})
+            switches += int(ss.get("switches", 0))
+            plain_steps += int(ss.get("plain_steps", 0))
+            meta_steps += int(ss.get("meta_steps", 0))
+            ds = out.get("last_dilemma_score", None)
+            if ds is not None:
+                dilemmas.append(float(ds))
+            tf_raw = out.get("ctrl_tf_raw_logit", None)
+            if tf_raw is not None and isinstance(tf_raw, torch.Tensor):
+                abs_ctrls.extend(tf_raw.detach().cpu().abs().reshape(-1).tolist())
+            n_batches += 1
     avg_loss = total_loss / max(1e-9, total_count)
     ppl = math.exp(min(20, avg_loss))
-    return avg_loss, ppl
-
-
-# =========================================================
-# 跑一遍模型 -> collection L1 gate 输入特征
-# model: enable_metacog=True
-# =========================================================
-def collect_gate_features(model, ids, msk, device):
-    o = model(ids, attention_mask=msk, enable_metacog=True)
-    num_layers = len(model.layers)
-    entropy_list = []
-    for layer in model.layers:
-        w = getattr(layer.triple_attn, '_last_attn_c', None)
-        if w is None:
-            w = getattr(layer.triple_attn, '_last_attn', None)
-        if w is not None and isinstance(w, torch.Tensor) and w.dim() == 4:
-            e = attention_entropy(w)
+    total_forward = plain_steps + meta_steps
+    plain_pct = (plain_steps / total_forward) if total_forward > 0 else 1.0
+    score_mean = float("nan")
+    if dilemmas:
+        score_mean = float(sum(dilemmas) / len(dilemmas))
+    ctrl_std = float("nan")
+    if abs_ctrls:
+        # "mean absolute deviation" of controller logits  — 用平均绝对偏差
+        if len(abs_ctrls) >= 2:
+            mean_a = sum(abs_ctrls) / len(abs_ctrls)
+            ctrl_std = float(sum(abs(v - mean_a) for v in abs_ctrls) / len(abs_ctrls))
         else:
-            e = torch.zeros(ids.size(0), 4, ids.size(1), device=device)
-        entropy_list.append(e)
-    feats = extract_features(entropy_list, o["logits"], ids)
-    sur = o.get("surprise", None)
-    if sur is not None and isinstance(sur, torch.Tensor):
-        feats = torch.cat([feats, sur.detach().unsqueeze(-1)], dim=-1)
-    else:
-        feats = torch.cat([feats, torch.zeros(feats.size(0), 1, device=feats.device)], dim=-1)
-    return feats  # [B, F_expected_by_model]
+            ctrl_std = float(abs_ctrls[0])
+    return avg_loss, ppl, switches, plain_pct, score_mean, ctrl_std
 
 
-# =========================================================
-# L1 gate 预训练（熵 percentile 标注）
-# =========================================================
-def pretrain_l1_gate(model, tr_dl, device,
-                     th_entropy_frac=0.70, th_lmp_frac=0.30, rep_th=2,
-                     pos_target_range=(0.25, 0.55),
-                     epochs=4, bs=64, lr=1e-3):
-    """返回 (model, gate_module)，gate 已经作为 model.l1_gate 的 state_dict 写入"""
-    print("    [L1 pretrain] collecting train features ...")
-    model.eval()
-    all_feats_tr = []
-    for b in tr_dl:
-        ids = b["input_ids"].to(device)
-        msk = b["attention_mask"].to(device)
-        with torch.no_grad():
-            feats = collect_gate_features(model, ids, msk, device)
-        all_feats_tr.append(feats.cpu())
-    all_feats_tr = torch.cat(all_feats_tr, dim=0)
-    feats_mean = all_feats_tr.mean(dim=0)
-    feats_std = all_feats_tr.std(dim=0, unbiased=False) + 1e-6
-    F = all_feats_tr.size(1)
-    num_layers = (F - 3) // 2
+def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500, lr=2e-3):
+    """variant_mode in {'plain', 'alwayson', 'conditional'}"""
+    random.seed(0); torch.manual_seed(0)
 
-    # entropy_mean 是前 num_layers 对特征的奇数位（mean）
-    ent_means = []
-    for i in range(num_layers):
-        ent_means.append(all_feats_tr[:, 2 * i])
-    ent_all = torch.stack(ent_means, dim=0).mean(dim=0)
-    lmp_all = all_feats_tr[:, -3]
-    rep_all = all_feats_tr[:, -1]
+    use_metacog = variant_mode != "plain"
 
-    def q(vals, p):
-        if vals.numel() == 0:
-            return torch.tensor(0.0)
-        return torch.quantile(vals.float(), p, interpolation="midpoint")
+    cfg = MetaCogXConfig(
+        vocab_size=260,
+        d_model=cfg_kwargs["d_model"],
+        d_meta=cfg_kwargs["d_meta"],
+        d_aware=cfg_kwargs["d_aware"],
+        num_layers=cfg_kwargs["layers"],
+        num_heads=cfg_kwargs["heads"],
+        d_ffn=cfg_kwargs["d_ffn"],
+        max_seq_len=cfg_kwargs["seq"],
+        attn_dropout=0.0,
+        resid_dropout=0.0,
+        ffn_dropout=0.0,
+    )
 
-    # 自适应多次尝试
-    pos_rate = 0.0
-    th_entropy = 0.0
-    th_maxprob = 0.0
-    for attempt, frac_e, frac_l in [
-        (0, 0.70, 0.30), (1, 0.75, 0.25), (2, 0.65, 0.35),
-        (3, 0.80, 0.20), (4, 0.60, 0.40), (5, 0.55, 0.45),
-    ]:
-        th_entropy = float(q(ent_all, frac_e).item())
-        th_maxprob = float(q(lmp_all, frac_l).item())
-        temp_lab = ((ent_all > th_entropy) | (lmp_all < th_maxprob) | (rep_all >= rep_th)).float()
-        pos_rate = float(temp_lab.mean().item())
-        if pos_target_range[0] <= pos_rate <= pos_target_range[1]:
-            break
-    print("    [L1 pretrain] th_ent={:.3f} th_lmp={:.3f} rep_th={}  pos_rate={:.3f}".format(
-        th_entropy, th_maxprob, rep_th, pos_rate))
+    # disable_tri_attn / use_dmn — 兼容未来 ablation
+    model = MetaCogXModel(cfg, enable_metacog=use_metacog)
 
-    # 构造标签
-    ent_means = []
-    for i in range(num_layers):
-        ent_means.append(all_feats_tr[:, 2 * i])
-    mean_ent_agg = torch.stack(ent_means, dim=0).mean(dim=0)
-    logits_maxprob = all_feats_tr[:, -3]
-    token_rep_mean = all_feats_tr[:, -1]
-    labels = ((mean_ent_agg > th_entropy) | (logits_maxprob < th_maxprob) | (token_rep_mean >= rep_th)).float()
+    # alwayson: 强制 meta head 永远激活 (极低 threshold + 初始 bias 大)
+    if variant_mode == "alwayson":
+        model._mode_state = "metacog"
+        model._plain_countdown = 0
+        model._meta_countdown = 0
+        if hasattr(model, "l1_gate") and hasattr(model.l1_gate, "enter_thresh"):
+            model.l1_gate.enter_thresh = -1.0
+            model.l1_gate.exit_thresh = -1.0
+            last = model.l1_gate.net[3]
+            if hasattr(last, "bias") and last.bias is not None:
+                nn.init.constant_(last.bias, 5.0)
+        for sdict_k in getattr(model, "_switch_stats", {}):
+            model._switch_stats[sdict_k] = 0
 
-    # 标准化
-    X_tr = (all_feats_tr - feats_mean) / feats_std
-    y_tr = labels
-
-    pos_w = float(max(1.0, min(10.0,
-        (y_tr == 0).float().sum().item() / max(1, (y_tr == 1).float().sum().item())
-    )))
-    print("    [L1 pretrain] pos_weight={:.3f}  F={}  n={}".format(pos_w, F, X_tr.size(0)))
-
-    # 构建 gate 模块 (clone l1_gate, 训练后再写回)
-    gate = model.l1_gate
-    opt_gate = torch.optim.AdamW(gate.parameters(), lr=lr, weight_decay=1e-4)
-    crit = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_w, device=device))
-    # 注意: 当前 DilemmaGate.net 最后一层是 Sigmoid, 不是裸 Linear!
-    # 这里我们需要 logits，所以重新训练一个临时 gate
-    class GateLogits(nn.Module):
-        def __init__(self, input_dim, hidden_dim=32, dropout=0.1):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, 1),
-            )
-        def forward(self, x):
-            return self.net(x).squeeze(-1)
-
-    gate_tmp = GateLogits(F, hidden_dim=32, dropout=0.1).to(device)
-    # 初始偏置让输出偏向 0（sigmoid 后 =0.5）
-    last = gate_tmp.net[-1]
-    if hasattr(last, 'bias') and last.bias is not None:
-        nn.init.constant_(last.bias, -2.0)  # sigmoid(-2)≈0.126 负样本略多，配合 pos_weight
-
-    opt_t = torch.optim.AdamW(gate_tmp.parameters(), lr=lr, weight_decay=1e-4)
-
-    Xd = X_tr.to(device)
-    yd = y_tr.to(device)
-    n = Xd.size(0)
-    best_f1 = -1.0
-    best_ckpt = None
-    for ep in range(epochs):
-        idx = torch.randperm(n, device=device)
-        total_loss = 0.0
-        steps = 0
-        for i in range(0, n, bs):
-            sel = idx[i : i + bs]
-            xb = Xd[sel]
-            yb = yd[sel]
-            opt_t.zero_grad()
-            logits = gate_tmp(xb)
-            loss = crit(logits, yb)
-            loss.backward()
-            nn.utils.clip_grad_norm_(gate_tmp.parameters(), 5.0)
-            opt_t.step()
-            total_loss += float(loss.item())
-            steps += 1
-
-        with torch.no_grad():
-            pr = torch.sigmoid(gate_tmp(Xd))
-        preds = (pr >= 0.5).float()
-        acc = float((preds == yd).float().mean().item())
-        tp = float(((preds == 1) & (yd == 1)).float().sum().item())
-        fp = float(((preds == 1) & (yd == 0)).float().sum().item())
-        fn = float(((preds == 0) & (yd == 1)).float().sum().item())
-        prec = tp / max(1e-9, tp + fp)
-        rec = tp / max(1e-9, tp + fn)
-        f1 = 2 * prec * rec / max(1e-9, prec + rec)
-        pos_s = pr[yd == 1].mean().item() if (yd == 1).any() else 0.0
-        neg_s = pr[yd == 0].mean().item() if (yd == 0).any() else 0.0
-        if f1 > best_f1:
-            best_f1 = f1
-            best_ckpt = {k: v.cpu().clone() for k, v in gate_tmp.state_dict().items()}
-
-        if ep < 3 or (ep + 1) % 2 == 0:
-            print("    [L1 pretrain] ep {:2d} loss={:.4f} acc={:.3f} P={:.3f} R={:.3f} F1={:.3f} pos_mu={:.3f} neg_mu={:.3f}".format(
-                ep + 1, total_loss / max(1, steps), acc, prec, rec, f1, pos_s, neg_s))
-
-    if best_ckpt is not None:
-        gate_tmp.load_state_dict(best_ckpt)
-
-    # 把 gate_tmp 的 "Linear+ReLU+Dropout+Linear" 权重拷进 model.l1_gate.net
-    # model.l1_gate.net = [Linear, ReLU, Dropout, Linear, Sigmoid]
-    l1 = model.l1_gate
-    with torch.no_grad():
-        l1.net[0].weight.copy_(gate_tmp.net[0].weight)
-        l1.net[0].bias.copy_(gate_tmp.net[0].bias)
-        l1.net[3].weight.copy_(gate_tmp.net[3].weight)
-        l1.net[3].bias.copy_(gate_tmp.net[3].bias)
-    print("    [L1 pretrain] done. copied weights into model.l1_gate (no sigmoid -> with sigmoid).")
-
-    # 验证一下：model.l1_gate(features) 已经是 sigmoid 输出
-    # X_tr 已经是标准化后的 [N, F] 特征，不需要再传 entropy_list 给 extract_features
-    # 直接 forward 即可
-    model.eval()
-    with torch.no_grad():
-        pr2 = torch.sigmoid(l1.net(X_tr.to(device)))
-    pr2_cpu = pr2.cpu()
-    preds2 = (pr2_cpu >= 0.5).float()
-    tp2 = float(((preds2 == 1) & (y_tr == 1)).float().sum().item())
-    fp2 = float(((preds2 == 1) & (y_tr == 0)).float().sum().item())
-    fn2 = float(((preds2 == 0) & (y_tr == 1)).float().sum().item())
-    prec2 = tp2 / max(1e-9, tp2 + fp2)
-    rec2 = tp2 / max(1e-9, tp2 + fn2)
-    f1_verify = 2 * prec2 * rec2 / max(1e-9, prec2 + rec2)
-    pos_mu = float(pr2_cpu[y_tr == 1].mean().item()) if (y_tr == 1).any() else 0.0
-    neg_mu = float(pr2_cpu[y_tr == 0].mean().item()) if (y_tr == 0).any() else 0.0
-    print("    [L1 pretrain] VERIFY on train: P={:.3f} R={:.3f} F1={:.3f} pos_mu={:.3f} neg_mu={:.3f}".format(
-        prec2, rec2, f1_verify, pos_mu, neg_mu))
-
-    # 打印 score 分布确认 enter/exit 阈值合理
-    print("    [L1 pretrain] score stats on train: min={:.3f} p10={:.3f} p30={:.3f} p50={:.3f} p70={:.3f} p90={:.3f} max={:.3f}".format(
-        float(pr2_cpu.min().item()),
-        float(torch.quantile(pr2_cpu.float(), 0.10, interpolation="midpoint").item()),
-        float(torch.quantile(pr2_cpu.float(), 0.30, interpolation="midpoint").item()),
-        float(torch.quantile(pr2_cpu.float(), 0.50, interpolation="midpoint").item()),
-        float(torch.quantile(pr2_cpu.float(), 0.70, interpolation="midpoint").item()),
-        float(torch.quantile(pr2_cpu.float(), 0.90, interpolation="midpoint").item()),
-        float(pr2_cpu.max().item()),
-    ))
-
-    # 返回阈值建议
-    p70 = float(torch.quantile(pr2_cpu.float(), 0.70, interpolation="midpoint").item())
-    p30 = float(torch.quantile(pr2_cpu.float(), 0.30, interpolation="midpoint").item())
-    return {
-        "th_entropy": th_entropy, "th_maxprob": th_maxprob, "rep_th": rep_th,
-        "pos_rate": pos_rate, "p70": p70, "p30": p30,
-    }
-
-
-# =========================================================
-# 单独预训练 backbone (CE, 不跑 metacog)
-# =========================================================
-def pretrain_backbone_plain(model, tr_dl, device, steps=400, lr=1e-3):
-    print("    [backbone pretrain] {} steps CE (plain)".format(steps))
-    model.train()
+    model = model.to(device)
+    total_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps))
+
+    print("\n" + "=" * 92, flush=True)
+    print(" variant : {}  enable_metacog={}  mode={}  params={:,}".format(
+        name, use_metacog, variant_mode, total_params
+    ), flush=True)
+    print("=" * 92, flush=True)
+    print(" {:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
+        "step", "loss", "val_ppl", "val_loss", "mode", "switches", "plain%", "score", "ctrlStd"
+    ), flush=True)
+    print("-" * 92, flush=True)
+
+    model.train()
     it = iter(tr_dl)
     for s in range(steps):
         try:
@@ -388,9 +241,17 @@ def pretrain_backbone_plain(model, tr_dl, device, steps=400, lr=1e-3):
             b = next(it)
         ids = b["input_ids"].to(device)
         msk = b["attention_mask"].to(device)
+
+        if variant_mode == "alwayson" and hasattr(model, "l1_gate") and hasattr(model.l1_gate, "enter_thresh"):
+            model.l1_gate.enter_thresh = -1.0
+            model.l1_gate.exit_thresh = -1.0
+            model._mode_state = "metacog"
+            model._plain_countdown = 0
+            model._meta_countdown = 0
+
         opt.zero_grad()
-        o = model(ids, attention_mask=msk, enable_metacog=False)
-        lg = o["logits"][:, :-1, :]
+        out = model(ids, attention_mask=msk, enable_metacog=use_metacog)
+        lg = out["logits"][:, :-1, :]
         tgt = ids[:, 1:]
         pm = msk[:, 1:].float()
         ce = F.cross_entropy(
@@ -401,331 +262,145 @@ def pretrain_backbone_plain(model, tr_dl, device, steps=400, lr=1e-3):
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        if (s + 1) % 200 == 0:
-            print("      step {:4d}  loss={:.4f}  ppl={:.2f}".format(
-                s + 1, float(loss.item()), math.exp(min(20, float(loss.item())))))
-
-
-# =========================================================
-# 单次 variant 运行
-# =========================================================
-def run_variant(name, variant_mode, tok, tr_dl, va_dl, device):
-    """variant_mode in {'plain', 'alwayson', 'conditional'}"""
-    random.seed(0); torch.manual_seed(0)
-
-    use_metacog = variant_mode != 'plain'
-
-    cfg = MetaCogXConfig(
-        d_model=128,
-        d_meta=32,
-        d_aware=16,
-        num_layers=4,
-        num_heads=4,
-        d_ffn=512,
-        max_seq_len=64,
-        vocab_size=260,
-        attn_dropout=0.0,
-        resid_dropout=0.0,
-        ffn_dropout=0.0,
-    )
-    model = MetaCogXModel(cfg, enable_metacog=use_metacog).to(device)
-
-    if variant_mode == 'plain':
-        opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=500)
-    elif variant_mode == 'alwayson':
-        model._mode_state = 'metacog'
-        model.l1_gate.enter_thresh = -1.0
-        model.l1_gate.exit_thresh = -1.0
-        last = model.l1_gate.net[3]
-        if hasattr(last, 'bias') and last.bias is not None:
-            nn.init.constant_(last.bias, 5.0)
-        opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=500)
-    elif variant_mode == 'conditional':
-        pretrain_backbone_plain(model, tr_dl, device, steps=400, lr=1e-3)
-        gate_stats = pretrain_l1_gate(model, tr_dl, device, epochs=4, bs=64, lr=1e-3)
-        enter_th = 0.38
-        exit_th = 0.25
-        if gate_stats['p70'] < enter_th:
-            enter_th = gate_stats['p70']
-        exit_th = max(0.20, enter_th - 0.12)
-        model.l1_gate.enter_thresh = enter_th
-        model.l1_gate.exit_thresh = exit_th
-        model._mode_state = 'plain'
-        model._plain_countdown = 0
-        model._meta_countdown = 0
-        model._switch_stats = {k: 0 for k in model._switch_stats}
-        baseline_ce = None
-        model.eval()
-        with torch.no_grad():
-            n_test = 0; ce_sum = 0.0
-            for bb in tr_dl:
-                ids = bb["input_ids"].to(device); msk = bb["attention_mask"].to(device)
-                oo = model(ids, attention_mask=msk, enable_metacog=True)
-                llg = oo["logits"][:, :-1, :]; tgt = ids[:, 1:]
-                pm = msk[:, 1:].float()
-                c = F.cross_entropy(llg.reshape(-1, llg.size(-1)), tgt.reshape(-1), ignore_index=0, reduction="none").reshape(ids.size(0), -1)
-                ce_sum += float((c * pm).sum().item())
-                n_test += float(pm.sum().item())
-        baseline_ce = ce_sum / max(1e-9, n_test)
-        print("    [conditional] baseline_ce={:.3f} (used in RL tf surrogate)".format(baseline_ce))
-        from training.rl_framework import MinimalPPO
-        rl = MinimalPPO(
-            model=model, lr=2e-3,
-            lambda_tf=0.5, lambda_gate=1.0, lambda_tf_l2=0.01,
-            baseline_ce=baseline_ce,
-            device=str(device),
-        )
-        opt = rl.opt
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=500)
-
-    print("\n" + "=" * 82)
-    print(" variant : {}".format(name))
-    print(" enable_metacog={}  mode={}  params={:,}".format(
-        use_metacog, variant_mode, sum(p.numel() for p in model.parameters())
-    ))
-    if variant_mode == 'conditional':
-        print("  enter_thresh={:.3f}  exit_thresh={:.3f}".format(
-            model.l1_gate.enter_thresh, model.l1_gate.exit_thresh))
-    print("=" * 82)
-    print(" {:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
-        "step", "loss", "val_ppl", "mode", "ctrl_std", "switches", "plain%", "meta%", "score"
-    ))
-    print("-" * 82)
-
-    hist_modes = []
-    hist_ctrl = []
-    hist_scores = []
-
-    it = iter(tr_dl)
-    for s in range(500):
-        try:
-            b = next(it)
-        except StopIteration:
-            it = iter(tr_dl)
-            b = next(it)
-        ids = b["input_ids"].to(device)
-        msk = b["attention_mask"].to(device)
-
-        if variant_mode == 'conditional':
-            rl_out = rl.train_step({"input_ids": ids, "attention_mask": msk})
-            loss = torch.tensor(rl_out["loss"])
-            o = rl_out["forward_out"]
-        else:
-            model.train()
-            opt.zero_grad()
-            o = model(ids, attention_mask=msk, enable_metacog=use_metacog)
-            lg = o["logits"][:, :-1, :]
-            tgt = ids[:, 1:]
-            pm = msk[:, 1:].float()
-            ce = F.cross_entropy(
-                lg.reshape(-1, lg.size(-1)), tgt.reshape(-1),
-                ignore_index=PAD, reduction="none",
-            ).reshape(ids.size(0), -1)
-            loss = (ce * pm).sum() / pm.sum().clamp(min=1.0)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+        if steps > 1:
             sched.step()
 
-        mode = o.get('mode', 'plain')
-        hist_modes.append(mode)
-        ds = o.get('last_dilemma_score', None)
-        if ds is not None:
-            hist_scores.append(ds)
-
-        if 'ctrl' in o and o['ctrl'] is not None and hasattr(o['ctrl'], 'temp_factor'):
-            tf = o['ctrl'].temp_factor
-            hist_ctrl.append(float(tf.detach().cpu().mean().item()))
-
-        if (s + 1) % 100 == 0 or (s + 1) == 500:
-            vloss, vppl = evaluate_ppl(model, va_dl, device, use_metacog)
-
-            last10_modes = hist_modes[-10:]
-            mode_counts = {}
-            for m in last10_modes:
-                mode_counts[m] = mode_counts.get(m, 0) + 1
-            majority_mode = max(mode_counts, key=mode_counts.get) if last10_modes else 'plain'
-
-            ctrl_std = float('nan')
-            if len(hist_ctrl) > 1:
-                c = torch.tensor(hist_ctrl[-min(100, len(hist_ctrl)):])
-                ctrl_std = float(c.std(unbiased=False).item())
-
-            sw = 0
-            plain_pct = 100.0
-            meta_pct = 0.0
-            ss = o.get('switch_stats', None)
-            if ss is not None:
-                sw = int(ss.get('switches', 0))
-                total = int(ss.get('plain_steps', 0) + ss.get('meta_steps', 0))
-                if total > 0:
-                    plain_pct = 100.0 * ss.get('plain_steps', 0) / total
-                    meta_pct = 100.0 * ss.get('meta_steps', 0) / total
-
-            score_str = "nan"
-            if hist_scores:
-                arr = torch.tensor(hist_scores[-min(100, len(hist_scores)):])
-                score_str = "{:.3f}/{:.3f}".format(float(arr.mean().item()), float(arr.std(unbiased=False).item()))
-
-            print(" {:6d} {:10.4f} {:10.2f} {:>10} {:10.4f} {:10d} {:9.1f}% {:9.1f}% {:>10}".format(
-                s + 1, float(loss.item()), vppl, majority_mode, ctrl_std, sw, plain_pct, meta_pct, score_str
+        if (s + 1) % max(1, (1 if steps <= 10 else (20 if steps <= 50 else 100))) == 0 or (s + 1) == steps:
+            vloss, vppl, sw, pp, score_m, ctrl_std = validate_ppl(
+                model, va_dl, device, use_metacog, mode=variant_mode, collect_stats=True
+            )
+            cur_mode = out.get("mode", "plain")
+            print(" {:6d} {:10.4f} {:10.2f} {:10.4f} {:>10} {:10d} {:9.1f}% {:10.4f} {:10.4f}".format(
+                s + 1, float(loss.item()), vppl, vloss, cur_mode, sw, pp * 100.0, score_m, ctrl_std
             ), flush=True)
 
-    final_vloss, final_vppl = evaluate_ppl(model, va_dl, device, use_metacog)
+    final_vloss, final_vppl, final_sw, final_pp, final_score_mean, final_ctrl_std = validate_ppl(
+        model, va_dl, device, use_metacog, mode=variant_mode, collect_stats=True
+    )
 
-    final_ctrl_std = float('nan')
-    if len(hist_ctrl) > 1:
-        c = torch.tensor(hist_ctrl[-min(200, len(hist_ctrl)):])
-        final_ctrl_std = float(c.std(unbiased=False).item())
-
-    ss = o.get('switch_stats', {})
-    final_sw = int(ss.get('switches', 0)) if ss else 0
-    total_steps = (ss.get('plain_steps', 0) + ss.get('meta_steps', 0)) if ss else 0
-    plain_pct = 100.0 * ss.get('plain_steps', 0) / max(1, total_steps) if ss else 100.0
-
-    final_score_mean = float('nan')
-    final_score_std = float('nan')
-    if hist_scores:
-        arr = torch.tensor(hist_scores[-min(200, len(hist_scores)):])
-        final_score_mean = float(arr.mean().item())
-        final_score_std = float(arr.std(unbiased=False).item())
-
-    print("-" * 82)
-    print(" FINAL ppl={:.4f}  ctrl_std={:.4f}  switches={}  plain={:.1f}%  score={:.3f}+/-{:.3f}".format(
-        final_vppl, final_ctrl_std, final_sw, plain_pct, final_score_mean, final_score_std
+    print("-" * 92, flush=True)
+    print(" FINAL ppl={:.4f}  loss={:.4f}  switches={}  plain={:.1f}%  score={:.3f}  ctrl_std={:.4f}".format(
+        final_vppl, final_vloss, final_sw, final_pp * 100.0, final_score_mean, final_ctrl_std
     ), flush=True)
 
     return {
         "name": name,
-        "final_ppl": final_vppl,
-        "final_loss": final_vloss,
-        "ctrl_std": final_ctrl_std,
-        "switches": final_sw,
-        "plain_pct": plain_pct,
-        "score_mean": final_score_mean,
-        "score_std": final_score_std,
+        "enable_metacog": use_metacog,
+        "mode": variant_mode,
+        "final_ppl": float(final_vppl),
+        "final_loss": float(final_vloss),
+        "switches": int(final_sw),
+        "plain_pct": float(final_pp),
+        "score_mean": float(final_score_mean if not math.isnan(final_score_mean) else 0.0),
+        "ctrl_std": float(final_ctrl_std if not math.isnan(final_ctrl_std) else 0.0),
     }
 
 
-# =========================================================
-# Main
-# =========================================================
-def main():
-    picked = pick_device()
-    if DML_AVAIL:
-        try:
-            import torch_directml
-            _dml_dev = torch_directml.device(0)
-            if isinstance(picked, torch.device) and str(picked.type) == 'privateuseone':
-                device = picked
-                dev_repr = "directml(0)"
-            elif isinstance(picked, torch.device) and picked.type == 'cpu':
-                device = _dml_dev
-                dev_repr = "directml(0)"
-            else:
-                device = picked
-                dev_repr = str(picked)
-        except Exception as e:
-            device = 'cpu'
-            dev_repr = 'cpu(dml_failed:{})'.format(e)
-    elif isinstance(picked, torch.device):
-        device = picked
-        dev_repr = str(picked.type)
-    else:
-        device = picked
-        dev_repr = str(picked)
-    tok = ByteTokenizer(max_len=64)
+def parse_args():
+    p = argparse.ArgumentParser("run_ab_v2.py  A/B evaluation")
+    p.add_argument("--quick", action="store_true", help="steps=10 val=32 (~30s)")
+    p.add_argument("--steps", type=int, default=500)
+    p.add_argument("--val", type=int, default=300)
+    p.add_argument("--out", type=str, default=str(ROOT / "runs" / "ab_results_v3.json"))
+    p.add_argument("--dmodel", type=int, default=128)
+    p.add_argument("--layers", type=int, default=4)
+    p.add_argument("--seq", type=int, default=64)
+    p.add_argument("--heads", type=int, default=4)
+    return p.parse_args()
 
-    pin = dev_repr.startswith("directml") or dev_repr.startswith("cuda")
-    num_work = 2 if pin else 0
+
+def main():
+    args = parse_args()
+    steps = 10 if args.quick else args.steps
+    val_n = 32 if args.quick else args.val
+    seq = args.seq
+    d_model = args.dmodel
+    layers = args.layers
+    heads = args.heads
+    d_ffn = 512
+    d_meta = 32
+    d_aware = 16
+    batch = 32
+
+    device = pick_device()
+    dev_repr = str(device)
+
+    tok = ByteTokenizer(max_len=seq)
+
+    pin = False
+    num_work = 0
 
     all_texts = build_texts(n=1200, seed=42)
-    tr_ds = ByteDataset(all_texts[:900], tok, 64)
-    va_ds = ByteDataset(all_texts[900:], tok, 64)
-    tr_dl = DataLoader(tr_ds, batch_size=32, shuffle=True, collate_fn=collate,
-                       num_workers=num_work, pin_memory=pin, persistent_workers=num_work>0)
-    va_dl = DataLoader(va_ds, batch_size=32, shuffle=False, collate_fn=collate,
-                       num_workers=num_work, pin_memory=pin, persistent_workers=num_work>0)
+    tr_ds = ByteDataset(all_texts[:900], tok, seq)
+    va_ds = ByteDataset(all_texts[900 : 900 + val_n], tok, seq)
+    tr_dl = DataLoader(tr_ds, batch_size=batch, shuffle=True, collate_fn=collate,
+                       num_workers=num_work, pin_memory=pin, persistent_workers=False)
+    va_dl = DataLoader(va_ds, batch_size=batch, shuffle=False, collate_fn=collate,
+                       num_workers=num_work, pin_memory=pin, persistent_workers=False)
 
-    print("=" * 82, flush=True)
-    print(" A/B EVALUATION v2  (3 variants, tiny byte-level model)".center(82), flush=True)
-    print(" device={}  train={}  val={}  steps=500  OMP={}  MKL={}  DML_AVAIL={}".format(
-        dev_repr, len(tr_ds), len(va_ds),
-        os.environ.get("OMP_NUM_THREADS", "?"), os.environ.get("MKL_NUM_THREADS", "?"), DML_AVAIL), flush=True)
-    print("=" * 82, flush=True)
+    print("=" * 92, flush=True)
+    print(" A/B EVALUATION v3  (3 variants)".center(92), flush=True)
+    print(" device={}  d_model={}  layers={}  heads={}  seq={}  d_ffn={}".format(
+        dev_repr, d_model, layers, heads, seq, d_ffn
+    ), flush=True)
+    print(" d_meta={}  d_aware={}  batch={}  steps={}  val_batches={}".format(
+        d_meta, d_aware, batch, steps, len(va_ds)
+    ), flush=True)
+    print(" OMP={}  MKL={}  DML_AVAIL={}  QUICK={}".format(
+        os.environ.get("OMP_NUM_THREADS"), os.environ.get("MKL_NUM_THREADS"), DML_AVAIL, args.quick
+    ), flush=True)
+    print("=" * 92, flush=True)
 
+    cfg_kwargs = dict(
+        d_model=d_model, d_meta=d_meta, d_aware=d_aware,
+        layers=layers, heads=heads, d_ffn=d_ffn, seq=seq,
+    )
+
+    t0 = time.time()
+    variants = [
+        ("gpt_plain",        "plain"),
+        ("alwayson_meta",     "alwayson"),
+        ("conditional_meta", "conditional"),
+    ]
     results = []
-
-    for name, mode in [
-        ("gpt_plain", "plain"),
-        ("metacog_alwayson", "alwayson"),
-        ("metacog_conditional", "conditional"),
-    ]:
-        r = run_variant(name, mode, tok, tr_dl, va_dl, device)
+    for name, mode in variants:
+        r = run_variant(name, mode, cfg_kwargs, tr_dl, va_dl, device, steps=steps)
         results.append(r)
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # 汇总
-    print("\n" + "=" * 82)
-    print(" FINAL SUMMARY TABLE")
-    print("=" * 82)
-    print(" {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
-        "variant", "val_ppl", "ctrl_std", "switches", "plain%", "loss", "score_m", "score_s"
-    ))
-    print("-" * 82)
+    wall = time.time() - t0
+
+    print("\n" + "=" * 92, flush=True)
+    print(" FINAL SUMMARY".center(92), flush=True)
+    print("=" * 92, flush=True)
+    print(" {:<22} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
+        "variant", "mode", "val_ppl", "val_loss", "switches", "plain%", "score", "ctrlStd"
+    ), flush=True)
+    print("-" * 92, flush=True)
     for r in results:
-        print(" {:<25} {:10.2f} {:10.4f} {:10d} {:9.1f}% {:10.4f} {:10.3f} {:10.3f}".format(
-            r["name"], r["final_ppl"], r["ctrl_std"], r["switches"], r["plain_pct"],
-            r["final_loss"], r["score_mean"], r["score_std"]
-        ))
-    print("=" * 82)
+        print(" {:<22} {:>8} {:10.2f} {:10.4f} {:10d} {:9.1f}% {:10.4f} {:10.4f}".format(
+            r["name"], r["mode"], r["final_ppl"], r["final_loss"], r["switches"],
+            r["plain_pct"] * 100.0, r["score_mean"], r["ctrl_std"]
+        ), flush=True)
+    print("=" * 92, flush=True)
+    print(" wall_seconds={:.1f}".format(wall), flush=True)
 
-    # 关键验证点
-    print("\n KEY CHECKS")
-    print("-" * 82)
-    cond = next(r for r in results if r["name"] == "metacog_conditional")
-    on = next(r for r in results if r["name"] == "metacog_alwayson")
-    gpt = next(r for r in results if r["name"] == "gpt_plain")
-
-    check1 = cond["ctrl_std"] > 0.05
-    check2 = cond["final_ppl"] <= on["final_ppl"] + 0.02
-    check3 = cond["switches"] >= 0
-
-    print("  [1] conditional ctrl std > 0.05       : {:.4f}  -> {}".format(
-        cond["ctrl_std"], "PASS" if check1 else "FAIL"
-    ))
-    print("  [2] conditional ppl <= alwayson ppl   : {:.2f} <= {:.2f}  -> {}".format(
-        cond["final_ppl"], on["final_ppl"], "PASS" if check2 else "FAIL"
-    ))
-    print("  [3] switches >= 0 (ideally > 0)       : {}  -> {}".format(
-        cond["switches"], "PASS" if cond["switches"] > 0 else "OK(=0)" if cond["switches"] == 0 else "FAIL"
-    ))
-    if cond["switches"] == 0:
-        print("       (conditional stayed in one mode; check enter/exit thresholds)")
-
-    overall = "PASS" if (check1 and check2 and cond["switches"] >= 0) else "CHECK DETAIL"
-    print("=" * 82)
-    print(" OVERALL : {}".format(overall))
-    print("=" * 82)
-
-    import json as _json
-    _out = {
-        "device": dev_repr,
+    out_obj = {
+        "wall_seconds": float(wall),
+        "device_picked": dev_repr,
         "omp": os.environ.get("OMP_NUM_THREADS"),
         "mkl": os.environ.get("MKL_NUM_THREADS"),
-        "results": results,
-        "key_checks": {
-            "conditional_ctrl_std_gt_0.05": bool(check1),
-            "conditional_ppl_le_alwayson_ppl_plus_0.02": bool(check2),
-            "switches_ge_0": bool(cond["switches"] >= 0),
-            "overall": overall,
-        },
+        "dml_available": DML_AVAIL,
+        "d_model": d_model, "layers": layers, "heads": heads, "seq": seq,
+        "steps": steps, "val_samples": len(va_ds),
+        "batch": batch, "lr": 2e-3,
+        "variants": results,
     }
-    _out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ab_results_v2.json")
-    with open(_out_path, "w", encoding="utf-8") as _f:
-        _json.dump(_out, _f, indent=2, default=str)
-    print(" RESULTS JSON -> {}".format(_out_path))
+    out_path = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out_obj, f, indent=2, default=str)
+    print(" RESULTS JSON -> {}".format(out_path), flush=True)
 
 
 if __name__ == "__main__":
