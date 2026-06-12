@@ -1,0 +1,83 @@
+﻿======================================================================
+L1 DilemmaGate Training
+  device        : cpu
+  backbone      : tiny MetaCogXModel 128/4/4
+  input_dim     : 11
+  pretrain      : 800 steps (byte-level CE, AdamW)
+  train samples : 2334
+  val samples   : 817
+======================================================================
+
+[Step 0] Pretraining backbone (800 steps) ...
+  step  200  loss=0.7477  ppl=2.11
+  step  400  loss=0.0744  ppl=1.08
+  step  600  loss=0.0318  ppl=1.03
+  step  800  loss=0.0545  ppl=1.06
+
+[Step 1] Sampling train features ...
+  entropy  q70=1.288 q80=1.302  maxprob  q30=0.850 q20=0.682
+  initial pos_rate=0.531  (th_ent=1.288, th_lmp=0.850, rep>=2)
+  final   pos_rate=0.531  (th_ent=1.288, th_lmp=0.850, rep>=2)
+
+[Step 2] Collecting train + val labeled features ...
+  train pos=1239 neg=1095  (53.1%)
+  val   pos=431 neg=386  (52.8%)
+
+  [feature stats per dim (train std)]
+    f00: mean=+1.4812  std=0.0605  min=1.366  max=1.601
+    f01: mean=+1.0097  std=0.0395  min=0.941  max=1.100
+    f02: mean=+1.1284  std=0.0578  min=1.018  max=1.243
+    f03: mean=+0.8669  std=0.0264  min=0.775  max=0.934
+    f04: mean=+1.1745  std=0.0674  min=1.012  max=1.285
+    f05: mean=+0.8525  std=0.0409  min=0.759  max=0.922
+    f06: mean=+1.3014  std=0.0970  min=1.070  max=1.509
+    f07: mean=+0.8885  std=0.0568  min=0.747  max=0.961
+    f08: mean=+0.8678  std=0.1899  min=0.383  max=1.000
+    f09: mean=+0.3511  std=0.4365  min=0.001  max=1.383
+    f10: mean=+0.2015  std=0.0576  min=0.109  max=0.312
+  pos_weight for BCE: 1.000
+
+[Step 3] Training DilemmaGate (15 epochs, lr=0.003) ...
+  epoch  1 loss=0.2060  tr[acc=0.996 P=0.993 R=1.000 F1=0.996]  va[acc=0.972 P=0.993 R=0.954 F1=0.973]  pos_mu=0.962 neg_mu=0.029  best@th=0.89/F1=0.976
+  epoch  2 loss=0.0156  tr[acc=0.997 P=0.994 R=1.000 F1=0.997]  va[acc=0.973 P=0.995 R=0.954 F1=0.974]  pos_mu=0.953 neg_mu=0.010  best@th=0.66/F1=0.976
+  epoch  3 loss=0.0105  tr[acc=0.998 P=0.996 R=1.000 F1=0.998]  va[acc=0.976 P=1.000 R=0.954 F1=0.976]  pos_mu=0.951 neg_mu=0.004  best@th=0.50/F1=0.976
+  epoch  4 loss=0.0104  tr[acc=0.998 P=0.996 R=1.000 F1=0.998]  va[acc=0.976 P=1.000 R=0.954 F1=0.976]  pos_mu=0.951 neg_mu=0.003  best@th=0.50/F1=0.976
+  epoch  5 loss=0.0114  tr[acc=0.996 P=0.993 R=1.000 F1=0.996]  va[acc=0.972 P=0.993 R=0.954 F1=0.973]  pos_mu=0.955 neg_mu=0.009  best@th=0.93/F1=0.976
+  epoch  6 loss=0.0047  tr[acc=0.997 P=0.994 R=1.000 F1=0.997]  va[acc=0.973 P=0.995 R=0.954 F1=0.974]  pos_mu=0.953 neg_mu=0.005  best@th=0.73/F1=0.976
+  epoch  7 loss=0.0055  tr[acc=0.999 P=0.998 R=1.000 F1=0.999]  va[acc=0.976 P=1.000 R=0.954 F1=0.976]  pos_mu=0.952 neg_mu=0.001  best@th=0.50/F1=0.976
+  epoch  8 loss=0.0024  tr[acc=0.999 P=0.998 R=1.000 F1=0.999]  va[acc=0.974 P=1.000 R=0.951 F1=0.975]  pos_mu=0.951 neg_mu=0.001  best@th=0.21/F1=0.976
+  epoch  9 loss=0.0049  tr[acc=0.999 P=1.000 R=0.998 F1=0.999]  va[acc=0.973 P=1.000 R=0.949 F1=0.974]  pos_mu=0.950 neg_mu=0.000  best@th=0.10/F1=0.976
+  epoch 10 loss=0.0044  tr[acc=0.996 P=1.000 R=0.993 F1=0.996]  va[acc=0.973 P=1.000 R=0.949 F1=0.974]  pos_mu=0.948 neg_mu=0.000  best@th=0.50/F1=0.974
+  epoch 11 loss=0.0064  tr[acc=0.999 P=0.998 R=1.000 F1=0.999]  va[acc=0.974 P=1.000 R=0.951 F1=0.975]  pos_mu=0.951 neg_mu=0.001  best@th=0.25/F1=0.976
+  epoch 12 loss=0.0026  tr[acc=0.996 P=1.000 R=0.993 F1=0.996]  va[acc=0.973 P=1.000 R=0.949 F1=0.974]  pos_mu=0.948 neg_mu=0.000  best@th=0.50/F1=0.974
+  epoch 13 loss=0.0071  tr[acc=0.996 P=1.000 R=0.993 F1=0.996]  va[acc=0.973 P=1.000 R=0.949 F1=0.974]  pos_mu=0.948 neg_mu=0.000  best@th=0.10/F1=0.975
+  epoch 14 loss=0.0037  tr[acc=1.000 P=1.000 R=1.000 F1=1.000]  va[acc=0.973 P=1.000 R=0.949 F1=0.974]  pos_mu=0.950 neg_mu=0.000  best@th=0.10/F1=0.975
+  epoch 15 loss=0.0039  tr[acc=1.000 P=1.000 R=1.000 F1=1.000]  va[acc=0.973 P=1.000 R=0.949 F1=0.974]  pos_mu=0.950 neg_mu=0.000  best@th=0.10/F1=0.975
+
+  (loaded best checkpoint, F1=0.976)
+
+======================================================================
+FINAL SUMMARY
+----------------------------------------------------------------------
+  backbone           : tiny MetaCogXModel (4L, d=128, h=4)
+  input_dim          : 11
+  label rule         : entropy_mean>1.288 OR logits_maxprob<0.850 OR token_rep>=2
+  train pos%         : 53.1%
+  val   pos%         : 52.8%
+----------------------------------------------------------------------
+  threshold (def)    : 0.500
+  val acc            : 0.9731
+python : Traceback (most recent call last):
+所在位置 行:1 字符: 5
++ & { python runs/train_l1_gate.py --epochs 15 --lr 3e-3 2>&1 | Out-Fil ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last) 
+   ::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "D:\Projects\MetaCog-X\runs\train_l1_gate.py", line 605, in <module>
+  File "D:\Projects\MetaCog-X\runs\train_l1_gate.py", line 582, in main
+    print("  thr={:.3f}  acc={:.4f}  P={:.4f}  R={:.4f}  F1={:.4f}  pos_mu={:.4
+f}  neg_mu={:.4f}".format(
+                                                 ^
+NameError: name 'p' is not defined. Did you mean: 'pm'?

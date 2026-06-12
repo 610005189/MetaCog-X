@@ -1,0 +1,41 @@
+﻿[1/5] variant=gpt: enable_metacog=False, CE-only
+[PASS] variant=gpt forward OK
+[2/5] variant=metacog: enable_metacog=True, 三分支 + TotalLoss
+[PASS] variant=metacog forward + TotalLoss OK: meta=0.0000 aware=0.0236
+[3/5] ab_trainer 跑 10 steps (gpt):
+[PASS] ab_trainer gpt 10 steps OK
+alidation: len=273, source=bundled-fallback
+  variant=gpt enable_metacog=False
+  total_params=6,986,771 trainable=6,986,771
+  training for 10 steps, evaluating every 200 steps...
+  step     1/10 | total=10.7866 ce=10.7866 meta=0.000000 aware=0.000000 |   0.1s
+  [eval] step=10 valid_ppl=33678.85 best_ppl=33678.85
+
+=== DONE variant=gpt ===
+  final_train_CE=10.5595
+  best_valid_ppl=33678.85
+  total_steps=10 elapsed=4.4s device=cpu
+  gen1: The meaning of life isadena twin Thebeen the recurrent Agriculture the number of
+  gen2: Artificial intelligence medicinalChem Voy The Lem twinBeh. policies by
+
+[4/5] ab_trainer 跑 10 steps (metacog):
+[PASS] ab_trainer metacog 10 steps OK
+=273, source=bundled-fallback
+  variant=metacog enable_metacog=True
+  total_params=6,968,270 trainable=6,968,270
+  training for 10 steps, evaluating every 200 steps...
+  step     1/10 | total=10.8279 ce=10.8276 meta=0.000028 aware=0.059860 |   0.1s
+  [eval] step=10 valid_ppl=31488.20 best_ppl=31488.20
+
+=== DONE variant=metacog ===
+  final_train_CE=10.3968
+  best_valid_ppl=31488.20
+  total_steps=10 elapsed=4.5s device=cpu
+  gen1: The meaning of life isdal iterationBT Finals andagra links plum Watergate Switzerland
+  gen2: Artificial intelligence byROR and aBT Rabbmor Parade iteration iteration
+
+[5/5] 参数量比较
+[INFO] params gpt=411,787 metacog=416,590 ratio=1.012 (extra 1.2%)
+[PASS] params ratio OK (< 10% extra)
+
+[PASS] Task2 A/B trainer verified OK in 66.0s

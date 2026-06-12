@@ -1,0 +1,19 @@
+RC=0
+STDOUT:
+[ab_trainer] variant=gpt seed=42 device=cpu
+  load_wikitext split=train: len=50, source=bundled-fallback
+  load_wikitext split=validation: len=273, source=bundled-fallback
+  variant=gpt enable_metacog=False
+  total_params=6,986,771 trainable=6,986,771
+  training for 10 steps, evaluating every 200 steps...
+  step     1/10 | total=10.7866 ce=10.7866 meta=0.000000 aware=0.000000 |   0.1s
+  [eval] step=10 valid_ppl=33678.85 best_ppl=33678.85
+
+=== DONE variant=gpt ===
+  final_train_CE=10.5595
+  best_valid_ppl=33678.85
+  total_steps=10 elapsed=4.2s device=cpu
+  gen1: The meaning of life isadena twin Thebeen the recurrent Agriculture the number of
+  gen2: Artificial intelligence medicinalChem Voy The Lem twinBeh. policies by
+
+STDERR:

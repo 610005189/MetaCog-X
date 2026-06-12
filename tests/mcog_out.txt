@@ -1,0 +1,8 @@
+RC=1
+OUT:
+
+ERR:
+Traceback (most recent call last):
+  File "D:\Projects\MetaCog-X\training\ab_trainer.py", line 11, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
