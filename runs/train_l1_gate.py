@@ -529,8 +529,39 @@ def main():
         gate.load_state_dict(best_ckpt)
         print("\n  (loaded best checkpoint, F1={:.3f})".format(best_f1))
 
-    # ---------- 最终汇总 ----------
+    # ---------- Step 4: 保存训练好的门控参数 ----------
+    print("\n[Step 4] Saving trained gate parameters ...")
     gate.eval()
+    
+    # 保存完整检查点：门控权重 + 特征标准化参数 + 最优阈值
+    checkpoint = {
+        'state_dict': best_ckpt if best_ckpt else gate.state_dict(),
+        'feats_mean': feats_mean.cpu(),
+        'feats_std': feats_std.cpu(),
+        'input_dim': input_dim,
+        'pos_rate': pos_rate2,
+        'thresholds': {
+            'th_entropy': th_entropy,
+            'th_maxprob': th_maxprob,
+            'rep_th': rep_th,
+        },
+        'suggested_enter_thresh': va_res["pos_mean"] * 0.7 + va_res["neg_mean"] * 0.3,
+        'suggested_exit_thresh': va_res["pos_mean"] * 0.3 + va_res["neg_mean"] * 0.7,
+        'metrics': {
+            'val_f1': va_res["f1_best"],
+            'val_pos_mean': va_res["pos_mean"],
+            'val_neg_mean': va_res["neg_mean"],
+            'train_f1': tr_res["f1_best"],
+        }
+    }
+    
+    # 保存到文件
+    ckpt_path = ROOT / 'checkpoints' / 'l1_gate_best.pt'
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, ckpt_path)
+    print(f"  saved to: {ckpt_path}")
+    
+    # ---------- 最终汇总 ----------
     def final_eval(X, y_true):
         with torch.no_grad():
             logits = gate(X)
@@ -568,6 +599,11 @@ def main():
 
     tr_res = final_eval(feats_tr_d, labs_tr_d)
     va_res = final_eval(feats_va_d, labs_va_d)
+    
+    # 计算建议的自适应阈值
+    suggested_enter = checkpoint['suggested_enter_thresh']
+    suggested_exit = checkpoint['suggested_exit_thresh']
+    score_gap = va_res["pos_mean"] - va_res["neg_mean"]
 
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
@@ -589,7 +625,13 @@ def main():
         va_res["f1_best"], va_res["pos_mean"], va_res["neg_mean"],
     ))
     print("-" * 70)
-    print("  score gap val      : {:.4f}".format(va_res["pos_mean"] - va_res["neg_mean"]))
+    print("  score gap val      : {:.4f}".format(score_gap))
+    print("-" * 70)
+    print("  SUGGESTED THRESHOLDS for L1 Gate:")
+    print("    enter_thresh      : {:.3f} (weighted between pos/neg means)".format(suggested_enter))
+    print("    exit_thresh       : {:.3f} (weighted between neg/pos means)".format(suggested_exit))
+    print("    enter_patience    : 2 (recommended)")
+    print("    exit_patience     : 3 (recommended)")
     print("=" * 70)
 
     vf = va_res["f1_best"]
@@ -602,6 +644,12 @@ def main():
     else:
         verdict = ">> NEEDS TUNING  (F1<0.4; adjust th_entropy/th_maxprob)"
     print(verdict)
+    
+    print("\n  To use this gate in MetaCogXModel:")
+    print("  1. Load checkpoint: torch.load('checkpoints/l1_gate_best.pt')")
+    print("  2. Set model.l1_gate.load_state_dict(checkpoint['state_dict'])")
+    print("  3. Set model.enter_thresh = checkpoint['suggested_enter_thresh']")
+    print("  4. Set model.exit_thresh = checkpoint['suggested_exit_thresh']")
 
 
 if __name__ == "__main__":

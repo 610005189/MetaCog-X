@@ -166,10 +166,16 @@ class MinimalPPO:
         # ce 比 baseline 差 → sign > 0 → loss_tf = - (+) * tf_raw → 梯度推 tf_raw ↑ ✅
         # ce 比 baseline 好 → sign < 0 → loss_tf = - (-) * tf_raw → 梯度推 tf_raw ↓ ✅
         if tf_raw is not None and isinstance(tf_raw, torch.Tensor):
-            ce_val = float(ce.detach().cpu())
-            sign_coef = 1.0 if ce_val > self.baseline_ce else -1.0
+            # 使用可微分的符号函数近似，保持梯度流
+            # ce - baseline 的符号决定我们希望 tf_raw 的方向
+            ce_diff = ce - self.baseline_ce  # 保持在计算图中
+            # 使用 softsign 或 tanh 作为可微分的符号近似
+            # tanh(x * 10) 在 x 较大时接近 sign(x)，同时保持可微分
+            sign_coef = torch.tanh(ce_diff * 10.0)  # [-1, 1]
+            
             tf_mean = tf_raw.mean()
-            loss_tf = -torch.tensor(float(sign_coef)) * tf_mean
+            # 核心损失：让 tf_raw 朝正确方向移动
+            loss_tf = -sign_coef * tf_mean
             total_loss = total_loss + self.lambda_tf * loss_tf
 
             # 弱 L2 去饱和：tf_raw_logit 朝 0 有一点拉力，但别抢过 sign loss
@@ -178,9 +184,10 @@ class MinimalPPO:
 
             parts["tf_surrogate"] = float(loss_tf.detach().cpu())
             parts["tf_l2"] = float(loss_tf_l2.detach().cpu())
-            parts["tf_sign"] = sign_coef
+            parts["tf_sign"] = float(sign_coef.detach().cpu())
             parts["tf_mean"] = float(tf_raw.mean().detach().cpu())
             parts["tf_raw_grad_fn"] = str(tf_raw.grad_fn) if tf_raw.grad_fn is not None else "NONE"
+            parts["ce_diff"] = float(ce_diff.detach().cpu())
 
         # --- gate BCE ---
         # mode == metacog → gate score 应该接近 1
