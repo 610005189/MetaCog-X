@@ -284,9 +284,13 @@ class MetaCogXModel(nn.Module):
                     torch.ones(B, device=device),
                     torch.zeros(B, device=device),
                 ], dim=-1)
-                h_self_init, surprise_init = self.dmn(self_features0)
-                h_self = h_self_init.detach()
-                surprise_for_step = surprise_init.detach()
+                if self.dmn is not None:
+                    h_self_init, surprise_init = self.dmn(self_features0)
+                    h_self = h_self_init.detach()
+                    surprise_for_step = surprise_init.detach()
+                else:
+                    h_self = torch.zeros(B, 16, device=device)
+                    surprise_for_step = torch.zeros(B, device=device)
         else:
             h_self = self._last_h_self.to(device)
             surprise_for_step = self._prev_surprise
@@ -367,9 +371,15 @@ class MetaCogXModel(nn.Module):
         )  # [B, 4]
 
         # DMN 前向（有梯度，加入正式计算图）
-        h_self_next, surprise = self.dmn(self_features)
-        self._last_h_self = h_self_next.detach()
-        self._last_surprise = surprise.detach()
+        if self.dmn is not None:
+            h_self_next, surprise = self.dmn(self_features)
+            self._last_h_self = h_self_next.detach()
+            self._last_surprise = surprise.detach()
+        else:
+            h_self_next = torch.zeros_like(self_features[:, :16]) if self_features.size(-1) >= 16 else torch.zeros(B, 16, device=device)
+            surprise = torch.zeros(B, device=device)
+            self._last_h_self = h_self_next.detach()
+            self._last_surprise = surprise.detach()
 
         # 7. L1 打分 + 模式切换（+ DMN surprise 作为额外特征维度）
         if use_metacog and len(entropy_list) == len(self.layers):

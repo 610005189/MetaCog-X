@@ -215,6 +215,14 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
                 nn.init.constant_(last.bias, 5.0)
         for sdict_k in getattr(model, "_switch_stats", {}):
             model._switch_stats[sdict_k] = 0
+    
+    # conditional: 设置合适的 gate 阈值，让它能在 plain 和 metacog 之间切换
+    elif variant_mode == "conditional":
+        if hasattr(model, "enter_thresh"):
+            model.enter_thresh = 0.45  # 设置在 score=0.5 以下，确保能触发切换
+            model.exit_thresh = 0.35   # 退出阈值，保持 hysteresis
+            model.enter_patience = 1   # 降低耐心要求
+            model.exit_patience = 1
 
     model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters())

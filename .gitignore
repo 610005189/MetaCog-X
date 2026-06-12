@@ -1,22 +1,61 @@
-﻿__pycache__/
+# Python
+__pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+
+# PyTorch
+*.pt
+*.pth
+
+# Data files
+*.csv
+*.json
 *.log
+
+# Runs directory
 runs/*.log
 runs/*.json
+runs/*.pt
+runs/*.csv
 runs/t_bench*
 runs/ab_results*
+
+# Root level temp files
 run_out.txt
 run_test.txt
 run_a.log
 run_diag.log
-run_diag2.py
-run_gpt.log
 diag_out.txt
 diag_result.txt
 task2gpt.log
+
+# Temp scripts (single underscore prefix)
 _diag_grad_v2.py
 _quick_test.py
 _v3_debug.py
 _v3_test.py
+
+# Trae IDE
+.trae/
+
+# Archive and docs
+archive/
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+venv/
+.env/
