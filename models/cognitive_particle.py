@@ -125,20 +125,21 @@ class DynamicScalingController(nn.Module):
             "awareness": 1.0
         }
 
-        # 任务特定调整
+        # 任务特定调整 - 保留张量以维持梯度流
         if task_id is not None:
             task_scale = self.task_scales(task_id)  # [B, 3]
-            scales["content"] *= float(task_scale[0, 0].sigmoid() * (self.max_scale - self.min_scale) + self.min_scale)
-            scales["meta"] *= float(task_scale[0, 1].sigmoid() * (self.max_scale - self.min_scale) + self.min_scale)
-            scales["awareness"] *= float(task_scale[0, 2].sigmoid() * (self.max_scale - self.min_scale) + self.min_scale)
+            task_scale_adjusted = task_scale.sigmoid() * (self.max_scale - self.min_scale) + self.min_scale
+            scales["content"] = scales["content"] * task_scale_adjusted[0, 0]
+            scales["meta"] = scales["meta"] * task_scale_adjusted[0, 1]
+            scales["awareness"] = scales["awareness"] * task_scale_adjusted[0, 2]
 
-        # 上下文感知调整
+        # 上下文感知调整 - 保留张量以维持梯度流
         if context_features is not None:
             context_scale = self.context_encoder(context_features)  # [B, 3]
-            context_scale = context_scale.sigmoid() * (self.max_scale - self.min_scale) + self.min_scale
-            scales["content"] *= float(context_scale[0, 0].item())
-            scales["meta"] *= float(context_scale[0, 1].item())
-            scales["awareness"] *= float(context_scale[0, 2].item())
+            context_scale_adjusted = context_scale.sigmoid() * (self.max_scale - self.min_scale) + self.min_scale
+            scales["content"] = scales["content"] * context_scale_adjusted[0, 0]
+            scales["meta"] = scales["meta"] * context_scale_adjusted[0, 1]
+            scales["awareness"] = scales["awareness"] * context_scale_adjusted[0, 2]
 
         return scales
 
@@ -184,15 +185,21 @@ class CognitiveParticle(nn.Module):
         self.meta_scale = nn.Parameter(torch.ones(1))
         self.aware_scale = nn.Parameter(torch.ones(1))
 
-        # 正交性损失模块
+        # 正交性损失模块 - 始终创建，未启用时设为None
+        self.enable_orthogonality = enable_orthogonality
         if enable_orthogonality:
             self.ortho_loss = OrthogonalityLoss(lambda_ortho=1.0, lambda_norm=0.1)
+        else:
+            self.ortho_loss = None
 
-        # 动态缩放控制器
+        # 动态缩放控制器 - 始终创建，未启用时设为None
+        self.enable_dynamic_scaling = enable_dynamic_scaling
         if enable_dynamic_scaling:
             self.scaling_controller = DynamicScalingController(
                 base_dims={"content": d_model, "meta": d_meta, "awareness": d_aware}
             )
+        else:
+            self.scaling_controller = None
 
         # 自适应投影矩阵（用于混合模式）
         self.mixing_weights = nn.Parameter(torch.eye(3))  # [3, 3]

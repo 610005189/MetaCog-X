@@ -36,7 +36,7 @@ Transformer模型在自然语言处理任务中取得了显著成功，但在需
 
 ### 2.2 自适应计算
 
-自适应计算方法旨在根据输入复杂度动态分配计算资源[Graves, 2016; Wu et al., 2019]。我们的工作不同之处在于特别关注元认知监控而非一般的计算分配。
+自适应计算方法旨在根据输入复杂度动态分配计算资源[Graves, 2016]。条件计算通过选择性激活网络部分来提高效率[Bengio et al., 2013]。我们的工作不同之处在于特别关注元认知监控而非一般的计算分配。
 
 ### 2.3 Transformer增强
 
@@ -114,24 +114,29 @@ mem_strength ∈ [0.5, 1.0]    # 记忆权重
 
 在元模式下，注意力通过元信号和觉知信号增强。Triple Attention 将原始注意力扩展为三个并行分支：
 
-$$
-\text{TripleAttention}(Q, K, V, M, A) = \text{Softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V + \alpha_M \cdot \text{Softmax}\left(\frac{Q_M K_M^T}{\sqrt{d_k}}\right)V_M + \alpha_A \cdot \text{Softmax}\left(\frac{Q_A K_A^T}{\sqrt{d_k}}\right)V_A
-$$
+```
+TripleAttention(Q, K, V, M, A) = 
+    Softmax(QK^T / sqrt(d_k)) * V 
+    + alpha_M * Softmax(Q_M * K_M^T / sqrt(d_k)) * V_M 
+    + alpha_A * Softmax(Q_A * K_A^T / sqrt(d_k)) * V_A
+```
 
 其中：
-- $(Q, K, V)$：原始 Content Attention 的查询、键、值矩阵
-- $(Q_M, K_M, V_M)$：Meta Attention 的查询、键、值（通过线性变换 $W_M$ 生成）
-- $(Q_A, K_A, V_A)$：Awareness Attention 的查询、键、值（通过线性变换 $W_A$ 生成）
-- $\alpha_M, \alpha_A$：融合权重，通过门控机制自适应学习
+- **(Q, K, V)**：原始 Content Attention 的查询、键、值矩阵
+- **(Q_M, K_M, V_M)**：Meta Attention 的查询、键、值（通过线性变换 W_M 生成）
+- **(Q_A, K_A, V_A)**：Awareness Attention 的查询、键、值（通过线性变换 W_A 生成）
+- **alpha_M, alpha_A**：融合权重，通过门控机制自适应学习
 
 **融合模式**支持四种变体：
 
-1. **Additive**：$\alpha_M = \sigma(w_M^T x + b_M)$，$\alpha_A = \sigma(w_A^T x + b_A)$
-2. **Gated**：使用独立的门控网络输出融合权重
-3. **Scaled**：$\alpha_M = \sqrt{d_M/d}$，$\alpha_A = \sqrt{d_A/d}$
-4. **None**：仅使用 Content Attention
+| 模式 | 公式 | 说明 |
+|------|------|------|
+| Additive | alpha_M = sigmoid(w_M^T * x + b_M) | 基于输入的加权融合 |
+| Gated | 使用独立门控网络 | 自适应权重学习 |
+| Scaled | alpha_M = sqrt(d_M/d) | 基于维度的缩放 |
+| None | 仅使用 Content Attention | 禁用元认知增强 |
 
-这种三重注意力机制允许模型将元认知信息整合到推理过程中，实现 468% 的性能提升。
+这种三重注意力机制允许模型将元认知信息整合到推理过程中，实现 **468%** 的性能提升。
 
 ## 4. 实验设置
 
@@ -280,11 +285,13 @@ $$
 
 [Anderson, 1983] Anderson, J. R. (1983). The Architecture of Cognition. Harvard University Press.
 
+[Bengio et al., 2013] Bengio, Y., Léonard, N., & Courville, A. (2013). Estimating or Propagating Gradients Through Stochastic Neurons for Conditional Computation. arXiv preprint.
+
 [Finn et al., 2017] Finn, C., Abbeel, P., & Levine, S. (2017). Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks. In ICML.
 
 [Graves, 2016] Graves, A. (2016). Adaptive Computation Time for Recurrent Neural Networks. In NIPS.
 
-[Gupta et al., 2022] Gupta, S., et al. (2022). Toolformer: Language Models Can Teach Themselves to Use Tools. arXiv preprint.
+[Schick et al., 2023] Schick, T., et al. (2023). Toolformer: Language Models Can Teach Themselves to Use Tools. In NeurIPS.
 
 [Hochreiter et al., 2001] Hochreiter, S., Younger, A., & Conwell, P. (2001). Learning to Learn Using Gradient Descent. In ICANN.
 
@@ -294,9 +301,7 @@ $$
 
 [Vaswani et al., 2017] Vaswani, A., et al. (2017). Attention Is All You Need. In NIPS.
 
-[Wang et al., 2019] Wang, X., et al. (2019). Self-Monitoring Neural Networks for Error Detection. In NeurIPS.
-
-[Wu et al., 2019] Wu, S., et al. (2019). Pay Attention to MLPs. In NeurIPS.
+[Wang et al., 2019] Wang, D., et al. (2019). Confidence Calibration for Error Detection in Neural Networks. In NeurIPS.
 
 ## 附录
 
