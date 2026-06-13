@@ -7,8 +7,7 @@
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 import random
 
@@ -184,7 +183,7 @@ class ImitationLearning:
         self.optimizer = torch.optim.AdamW([
             {"params": model.parameters(), "lr": lr * 0.1},
             {"params": controller.parameters(), "lr": lr},
-            {"params": trigger.parameters(), "lr": lr}
+            {"params": self.trigger.parameters(), "lr": lr}
         ])
 
     def add_expert_demo(
@@ -239,12 +238,8 @@ class ImitationLearning:
 
         # 获取模型预测
         inputs = self.model.tokenizer(problem, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(self.model.device)
-
-        with torch.no_grad():
-            outputs = self.model(input_ids)
-            expert_inputs = self.model.tokenizer(expert_response, return_tensors="pt")
-            expert_ids = expert_inputs["input_ids"].to(self.model.device)
+        # input_ids 用于后续可能的扩展，当前简化实现中未直接使用
+        _ = inputs["input_ids"].to(self.model.device)
 
         # 简化的损失：鼓励模型在类似情况下输出类似专家的token
         # 实际应该用Seq2Seq损失

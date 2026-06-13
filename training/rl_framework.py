@@ -172,7 +172,7 @@ class MinimalPPO:
             # 使用 softsign 或 tanh 作为可微分的符号近似
             # tanh(x * 10) 在 x 较大时接近 sign(x)，同时保持可微分
             sign_coef = torch.tanh(ce_diff * 10.0)  # [-1, 1]
-            
+
             tf_mean = tf_raw.mean()
             # 核心损失：让 tf_raw 朝正确方向移动
             loss_tf = -sign_coef * tf_mean

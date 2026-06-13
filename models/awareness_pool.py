@@ -5,7 +5,7 @@
 """
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, List
+from typing import Optional, List
 from dataclasses import dataclass
 
 

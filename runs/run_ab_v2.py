@@ -113,6 +113,9 @@ def build_texts(n=1200, seed=42):
 def validate_ppl(model, dl, device, enable_metacog, mode="normal", collect_stats=False):
     """返回 (avg_ce_loss, ppl, switches, plain_pct, score_mean, ctrl_std)"""
     model.eval()
+    # 重置 awareness_pool 以确保每个 batch 的 stats 是独立的
+    if hasattr(model, "awareness_pool") and model.awareness_pool is not None:
+        model.awareness_pool.reset()
     # 不要重置 switch_stats，只初始化缺失的键
     if hasattr(model, "_switch_stats"):
         for k in ["switches", "total_forward", "plain_steps", "meta_steps"]:
@@ -306,12 +309,6 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
         ).reshape(ids.size(0), -1)
         ce_loss = (ce * pm).sum() / pm.sum().clamp(min=1.0)
 
-        # 更新基线 CE（使用 EMA）
-        if baseline_ce_tensor is None:
-            baseline_ce_tensor = ce_loss.detach().clone()
-        else:
-            baseline_ce_tensor = 0.95 * baseline_ce_tensor + 0.05 * ce_loss.detach()
-
         total_loss = ce_loss
 
         # --- Controller TF surrogate 损失 ---
@@ -322,22 +319,34 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
             ctrl_history.append(float(tf_raw.mean().detach().cpu()))
             if len(ctrl_history) > 100:
                 ctrl_history.pop(0)
-            
-            # ce_diff = ce_loss - baseline: 正值表示比基线差，需要 tf 增大
-            ce_diff = ce_loss - baseline_ce_tensor
-            
-            # 使用更激进的 sign 函数：
-            # soft_sign = x / (|x| + eps) 在 |x| > 0.1 时接近 sign
-            # 但我们需要一个在 0 附近也有信号的版本
-            # 使用：sign_coef = ce_diff / (|ce_diff| + 0.5)
+
+            # 计算样本级别的 CE 损失（而不是全局平均）
+            # ce: [B, seq_len] 每个样本每个位置的 CE 损失
+            # pm: [B, seq_len] mask
+            sample_ce = (ce * pm).sum(dim=-1) / pm.sum(dim=-1).clamp(min=1.0)  # [B]
+
+            # 样本级别的基线 CE（使用 EMA）
+            if baseline_ce_tensor is None:
+                baseline_ce_tensor = sample_ce.detach().clone()  # [B]
+            else:
+                # 确保 baseline 形状匹配
+                if baseline_ce_tensor.shape[0] != sample_ce.shape[0]:
+                    baseline_ce_tensor = sample_ce.detach().clone()
+                else:
+                    baseline_ce_tensor = 0.95 * baseline_ce_tensor + 0.05 * sample_ce.detach()
+
+            # 样本级别的 CE 差异：[B]
+            ce_diff = sample_ce - baseline_ce_tensor  # [B]
+
+            # 使用样本级别的 sign 函数
             eps = 0.5
-            sign_coef = ce_diff / (ce_diff.abs() + eps)
-            
-            # 核心损失：让 tf_raw 朝着正确的方向移动
-            # 如果 ce > baseline（差）：sign_coef > 0 → loss_tf = -sign * tf → tf ↑ 时 loss ↓ → 推 tf ↑
-            # 如果 ce < baseline（好）：sign_coef < 0 → loss_tf = -sign * tf → tf ↓ 时 loss ↓ → 推 tf ↓
-            tf_mean = tf_raw.mean()
-            loss_tf = -sign_coef * tf_mean
+            sign_coef = ce_diff / (ce_diff.abs() + eps)  # [B]
+
+            # 样本级别的损失：每个样本有独立的梯度信号
+            # tf_raw: [B, 1], sign_coef: [B]
+            # 让 tf_raw 朝着正确的方向移动
+            tf_per_sample = tf_raw.squeeze(-1)  # [B]
+            loss_tf = -(sign_coef * tf_per_sample).mean()  # 平均样本损失
             total_loss = total_loss + lambda_tf * loss_tf
 
             # 熵正则：鼓励 controller 产生不同的输出
@@ -350,6 +359,33 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
             # 弱 L2 去饱和：tf_raw 不要太大
             loss_tf_l2 = tf_raw.pow(2).mean()
             total_loss = total_loss + lambda_l2 * loss_tf_l2
+
+            # 添加更强的方差鼓励损失：鼓励 tf_raw 在样本间有差异
+            # 使用样本间的标准差作为正则化目标
+            tf_std = tf_per_sample.std()
+            target_std = 0.15  # 目标标准差（增大）
+            # 使用惩罚式损失：如果 std < target_std，惩罚更大
+            if tf_std < target_std:
+                loss_variance = 5.0 * (target_std - tf_std)  # 强惩罚
+            else:
+                loss_variance = 0.1 * (tf_std - target_std)  # 弱惩罚（不要太大）
+            total_loss = total_loss + loss_variance
+
+            # 添加样本间差异鼓励：直接鼓励样本间的差异
+            # 使用 pairwise difference 的方差
+            if tf_per_sample.shape[0] > 1:
+                # 计算样本间的 pairwise difference
+                diff_matrix = tf_per_sample.unsqueeze(1) - tf_per_sample.unsqueeze(0)  # [B, B]
+                # 取非对角元素的方差
+                diff_vals = diff_matrix.view(-1)
+                # 排除对角元素（自己与自己比较）
+                non_diag_mask = ~torch.eye(tf_per_sample.shape[0], dtype=torch.bool, device=device).view(-1)
+                diff_non_diag = diff_vals[non_diag_mask]
+                if len(diff_non_diag) > 0:
+                    diff_std = diff_non_diag.std()
+                    target_diff_std = 0.2  # 目标 pairwise difference std
+                    loss_pairwise = 2.0 * (target_diff_std - diff_std).abs()
+                    total_loss = total_loss + loss_pairwise
 
         # --- L1 Gate 训练损失 ---
         # L1 Gate 应该学会：当 CE 损失高时输出更高的 dilemma_score，当 CE 损失低时输出更低的 score

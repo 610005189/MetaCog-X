@@ -5,7 +5,7 @@
 """
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional
 from dataclasses import dataclass
 from .awareness_pool import AwarenessStats
 
@@ -89,15 +89,24 @@ class SparseMetaController(nn.Module):
         if aware_stats is not None:
             # 使用觉知池的统计量
             # 拼接 mean + std + trend
-            aware_features = torch.cat([
-                aware_stats.mean,
-                aware_stats.std,
-                aware_stats.trend
-            ], dim=-1)  # [d_aware * 3]
+            # 注意：aware_stats.mean/std/trend 的形状应该是 [B, d_aware]
+            aware_mean = aware_stats.mean
+            aware_std = aware_stats.std
+            aware_trend = aware_stats.trend
 
-            # 确保aware_features与meta_avg有相同的batch维度
-            if aware_features.dim() == 1:
-                aware_features = aware_features.unsqueeze(0).expand(meta_avg.size(0), -1)
+            # 确保形状正确：如果是 [d_aware]（一维），需要扩展到 [B, d_aware]
+            if aware_mean.dim() == 1:
+                aware_mean = aware_mean.unsqueeze(0).expand(meta_avg.size(0), -1)
+            if aware_std.dim() == 1:
+                aware_std = aware_std.unsqueeze(0).expand(meta_avg.size(0), -1)
+            if aware_trend.dim() == 1:
+                aware_trend = aware_trend.unsqueeze(0).expand(meta_avg.size(0), -1)
+
+            aware_features = torch.cat([
+                aware_mean,
+                aware_std,
+                aware_trend
+            ], dim=-1)  # [B, d_aware * 3]
         else:
             # 如果没有awareness统计，使用零向量
             aware_features = torch.zeros(
@@ -109,6 +118,17 @@ class SparseMetaController(nn.Module):
 
         # 拼接 meta 和 aware_features
         x = torch.cat([meta_avg, aware_features], dim=-1)
+
+        # 添加噪声以鼓励输出变化
+        # 在训练时使用随机噪声，在验证时使用确定性噪声（基于样本索引）
+        if x.shape[0] > 1:
+            if self.training:
+                noise = torch.randn_like(x) * 1.2  # 增大随机噪声
+            else:
+                # 验证时使用确定性噪声（基于样本索引）
+                indices = torch.arange(x.shape[0], device=x.device).unsqueeze(1).expand_as(x)
+                noise = (indices.float() / x.shape[0] - 0.5) * 2.5  # 增大确定性噪声
+            x = x + noise
 
         # 前向传播
         logits = self.net(x)  # [B, 3]

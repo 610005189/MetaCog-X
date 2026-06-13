@@ -8,10 +8,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
-import math
 
 
 @dataclass
@@ -227,8 +225,6 @@ class GRPO:
         entropy_losses = []
 
         for sample in samples:
-            states = sample["states"]
-            actions = sample["actions"]
             rewards = sample["rewards"]
             old_log_probs = sample["log_probs"]
 

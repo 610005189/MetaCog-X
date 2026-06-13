@@ -69,7 +69,7 @@ class EnlightenmentTrigger(nn.Module):
         self._last_tokens: List[int] = []
         self._repeat_count = 0
 
-    def reset(self):
+    def reset(self) -> None:
         """重置触发器状态"""
         self._entropy_counter = 0
         self._last_tokens.clear()
@@ -131,7 +131,7 @@ class EnlightenmentTrigger(nn.Module):
 
     def detect_awareness_anomaly(
         self,
-        aware_stats,
+        aware_stats: Optional[Any],
         expected_mean: Optional[torch.Tensor] = None
     ) -> Tuple[bool, float]:
         """
@@ -166,7 +166,7 @@ class EnlightenmentTrigger(nn.Module):
     def forward(
         self,
         logits: torch.Tensor,
-        aware_stats=None,
+        aware_stats: Optional[Any] = None,
         tokens: Optional[torch.Tensor] = None,
         step: int = 0
     ) -> TriggerResult:

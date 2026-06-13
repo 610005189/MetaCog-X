@@ -377,7 +377,7 @@ class MetaCogXModel(nn.Module):
             self._last_h_self = h_self_next.detach()
             self._last_surprise = surprise.detach()
         else:
-            h_self_next = torch.zeros_like(self_features[:, :16]) if self_features.size(-1) >= 16 else torch.zeros(B, 16, device=device)
+            h_self_next = torch.zeros_like(self_features[:, :16]) if self_features.size(-1) >= 16 else torch.zeros(B, 16, device=device)  # noqa: E501
             surprise = torch.zeros(B, device=device)
             self._last_h_self = h_self_next.detach()
             self._last_surprise = surprise.detach()

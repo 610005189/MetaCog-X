@@ -11,21 +11,27 @@
 仅 seed / steps / variant / data 路径可变.
 """
 
-import argparse, os, random, sys, time, math, csv
+import argparse
+import os
+import random
+import sys
+import time
+import math
+import csv
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import MetaCogXConfig
-from models import MetaCogXModel
-from data.hf_dataset import load_wikitext_dataset
-from training.losses import TotalLoss
-from transformers import AutoTokenizer
+from config import MetaCogXConfig  # noqa: E402
+from models import MetaCogXModel  # noqa: E402
+from data.hf_dataset import load_wikitext_dataset  # noqa: E402
+from training.losses import TotalLoss  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
 
 
-def set_seed(seed):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     try:
         import numpy as _np
@@ -37,7 +43,7 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def collate_fn(batch):
+def collate_fn(batch: list) -> dict:
     ids = torch.stack([b[0] for b in batch])
     msk = torch.stack([b[1] for b in batch])
     return {"input_ids": ids, "attention_mask": msk}
@@ -190,7 +196,7 @@ def main():
                     vids = vb["input_ids"].to(device)
                     vmsk = vb["attention_mask"].to(device)
                     vout = model(vids, attention_mask=vmsk, labels=None,
-                                  return_meta=False, enable_metacog=True)
+                                 return_meta=False, enable_metacog=True)
                     vlogits = vout["logits"]
                     sl = vlogits[..., :-1, :].contiguous()
                     la = vids[..., 1:].contiguous()
@@ -247,12 +253,18 @@ def main():
     print(f"  total_steps={args.steps} elapsed={elapsed:.1f}s device={device}")
 
     model.eval()
+
     def gen(prompt):
         ids = tok.encode(prompt)
         if len(ids) > args.max_seq_len - 1:
             ids = ids[-(args.max_seq_len - 1):]
         input_ids = torch.tensor([ids]).to(device)
-        gen_kwargs = dict(max_new_tokens=min(10, args.max_seq_len - len(ids) - 1), temperature=0.7, top_k=30, verbose=False)
+        gen_kwargs = dict(
+            max_new_tokens=min(10, args.max_seq_len - len(ids) - 1),
+            temperature=0.7,
+            top_k=30,
+            verbose=False
+        )
         if gen_kwargs["max_new_tokens"] < 1:
             gen_kwargs["max_new_tokens"] = 1
         with torch.no_grad():

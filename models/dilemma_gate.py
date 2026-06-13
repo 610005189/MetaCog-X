@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-import math
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 
 def attention_entropy(attn_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -12,7 +11,7 @@ def attention_entropy(attn_weights: torch.Tensor, eps: float = 1e-8) -> torch.Te
     return -(attn_weights * torch.log(attn_weights + eps)).sum(dim=-1)
 
 
-def logits_stats(logits: torch.Tensor, eps: float = 1e-8) -> Dict[str, torch.Tensor]:
+def logits_stats(logits: torch.Tensor, eps: float = 1e-8) -> dict:
     """从 next-token logits 提取统计
     返回 dict: {
       'max_prob': [B],
@@ -53,7 +52,6 @@ def extract_features(
     返回: [B, F] 特征向量，F = 2*num_layers + 3 (+1 if surprise given)
     """
     B = entropy_list[0].size(0)
-    num_layers = len(entropy_list)
     feats = []
     for e in entropy_list:
         if e.dim() == 4:
@@ -100,6 +98,12 @@ class DilemmaGate(nn.Module):
         """features: [B, F] -> [B]"""
         return self.net(features).squeeze(-1)
 
-    def __call__(self, entropy_list, logits=None, token_ids=None, surprise=None):
+    def __call__(
+        self,
+        entropy_list: List[torch.Tensor],
+        logits: Optional[torch.Tensor] = None,
+        token_ids: Optional[torch.Tensor] = None,
+        surprise: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         feats = extract_features(entropy_list, logits, token_ids, surprise)
         return self.forward(feats)

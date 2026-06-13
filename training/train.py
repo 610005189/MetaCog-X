@@ -15,7 +15,7 @@ class Trainer:
     def __init__(
         self,
         model: nn.Module,
-        config,
+        config: Any,
         train_loader: Optional[DataLoader] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"

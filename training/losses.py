@@ -231,7 +231,7 @@ class TotalLoss(nn.Module):
                     layer_div_val = cos_sum / pairs
 
         loss_total = loss_ce + self.alpha * loss_meta + self.beta * loss_aware \
-                     + loss_entropy + self.delta * layer_div_val
+            + loss_entropy + self.delta * layer_div_val
 
         loss_components = {
             "loss_total": loss_total,
