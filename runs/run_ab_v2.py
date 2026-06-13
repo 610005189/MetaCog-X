@@ -113,16 +113,21 @@ def build_texts(n=1200, seed=42):
 def validate_ppl(model, dl, device, enable_metacog, mode="normal", collect_stats=False):
     """返回 (avg_ce_loss, ppl, switches, plain_pct, score_mean, ctrl_std)"""
     model.eval()
-    model._switch_stats = {k: 0 for k in model._switch_stats} if hasattr(model, "_switch_stats") else {
-        "switches": 0, "total_forward": 0, "plain_steps": 0, "meta_steps": 0,
-    }
+    # 不要重置 switch_stats，只初始化缺失的键
+    if hasattr(model, "_switch_stats"):
+        for k in ["switches", "total_forward", "plain_steps", "meta_steps"]:
+            if k not in model._switch_stats:
+                model._switch_stats[k] = 0
+    else:
+        model._switch_stats = {
+            "switches": 0, "total_forward": 0, "plain_steps": 0, "meta_steps": 0,
+        }
     total_loss = 0.0
     total_count = 0
     switches = 0
     plain_steps = 0
     meta_steps = 0
     dilemmas = []
-    abs_ctrls = []
     n_batches = 0
     with torch.no_grad():
         for b in dl:
@@ -157,9 +162,6 @@ def validate_ppl(model, dl, device, enable_metacog, mode="normal", collect_stats
             ds = out.get("last_dilemma_score", None)
             if ds is not None:
                 dilemmas.append(float(ds))
-            tf_raw = out.get("ctrl_tf_raw_logit", None)
-            if tf_raw is not None and isinstance(tf_raw, torch.Tensor):
-                abs_ctrls.extend(tf_raw.detach().cpu().abs().reshape(-1).tolist())
             n_batches += 1
     avg_loss = total_loss / max(1e-9, total_count)
     ppl = math.exp(min(20, avg_loss))
@@ -169,13 +171,32 @@ def validate_ppl(model, dl, device, enable_metacog, mode="normal", collect_stats
     if dilemmas:
         score_mean = float(sum(dilemmas) / len(dilemmas))
     ctrl_std = float("nan")
-    if abs_ctrls:
-        # "mean absolute deviation" of controller logits  — 用平均绝对偏差
-        if len(abs_ctrls) >= 2:
-            mean_a = sum(abs_ctrls) / len(abs_ctrls)
-            ctrl_std = float(sum(abs(v - mean_a) for v in abs_ctrls) / len(abs_ctrls))
-        else:
-            ctrl_std = float(abs_ctrls[0])
+    ctrl_vals = []  # 收集原始 tf_raw 值（不是绝对值）
+    for i, b in enumerate(dl):
+        if i >= 100:  # 只收集前 100 个 batch
+            break
+        ids = b["input_ids"].to(device)
+        msk = b["attention_mask"].to(device)
+        if mode == "alwayson" and enable_metacog and hasattr(model, "l1_gate"):
+            model.l1_gate.enter_thresh = -1.0
+            model.l1_gate.exit_thresh = -1.0
+            model._mode_state = "metacog"
+            model._plain_countdown = 0
+            model._meta_countdown = 0
+        elif mode == "conditional" and enable_metacog and hasattr(model, "l1_gate"):
+            pass
+        with torch.no_grad():
+            out = model(ids, attention_mask=msk, enable_metacog=enable_metacog)
+            tf_raw = out.get("ctrl_tf_raw_logit", None)
+            if tf_raw is not None and isinstance(tf_raw, torch.Tensor):
+                # 收集原始值（不是绝对值）来计算标准差
+                ctrl_vals.extend(tf_raw.detach().cpu().reshape(-1).tolist())
+    if len(ctrl_vals) >= 2:
+        mean_ctrl = sum(ctrl_vals) / len(ctrl_vals)
+        variance = sum((v - mean_ctrl) ** 2 for v in ctrl_vals) / len(ctrl_vals)
+        ctrl_std = float(math.sqrt(variance))
+    elif len(ctrl_vals) == 1:
+        ctrl_std = 0.0
     return avg_loss, ppl, switches, plain_pct, score_mean, ctrl_std
 
 
@@ -186,7 +207,7 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
     use_metacog = variant_mode != "plain"
 
     cfg = MetaCogXConfig(
-        vocab_size=260,
+        vocab_size=cfg_kwargs["vocab_size"],
         d_model=cfg_kwargs["d_model"],
         d_meta=cfg_kwargs["d_meta"],
         d_aware=cfg_kwargs["d_aware"],
@@ -218,16 +239,33 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
     
     # conditional: 设置合适的 gate 阈值，让它能在 plain 和 metacog 之间切换
     elif variant_mode == "conditional":
+        # 策略：设置 enter_thresh=0.25, exit_thresh=0.10
+        # - 当 score > 0.25 时，进入 metacog 模式
+        # - 当 score < 0.10 时，退出到 plain 模式
+        if hasattr(model, "l1_gate") and hasattr(model.l1_gate, "net"):
+            # 初始化偏置为负值，让初始 score ≈ 0.27-0.30
+            last = model.l1_gate.net[3]
+            if hasattr(last, "bias") and last.bias is not None:
+                nn.init.constant_(last.bias, -0.8)
         if hasattr(model, "enter_thresh"):
-            model.enter_thresh = 0.45  # 设置在 score=0.5 以下，确保能触发切换
-            model.exit_thresh = 0.35   # 退出阈值，保持 hysteresis
-            model.enter_patience = 1   # 降低耐心要求
-            model.exit_patience = 1
+            model.enter_thresh = 0.25  # 低于初始 score，让它进入 metacog
+            model.exit_thresh = 0.10   # 退出到 plain 的阈值
+            model.enter_patience = 1   # 连续 1 次超过阈值就切换
+            model.exit_patience = 1    # 连续 1 次低于阈值就退出
+        print(f"  [INFO] Set enter_thresh=0.25, exit_thresh=0.10, patience=(1,1)")
 
     model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, steps))
+
+    # Controller 训练参数
+    baseline_ce = 2.0  # 初始基线 CE
+    lambda_tf = 2.0   # Controller TF 损失的权重（增大以提供更强的梯度信号）
+    lambda_l2 = 0.001  # L2 正则化权重（减小，避免与 sign loss 冲突）
+    lambda_entropy = 0.05  # 熵正则权重（鼓励探索）
+    baseline_ce_tensor = None  # 用于跟踪基线 CE
+    ctrl_history = []  # 用于跟踪 controller 输出
 
     print("\n" + "=" * 92, flush=True)
     print(" variant : {}  enable_metacog={}  mode={}  params={:,}".format(
@@ -258,7 +296,7 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
             model._meta_countdown = 0
 
         opt.zero_grad()
-        out = model(ids, attention_mask=msk, enable_metacog=use_metacog)
+        out = model(ids, attention_mask=msk, enable_metacog=use_metacog, return_meta=True)
         lg = out["logits"][:, :-1, :]
         tgt = ids[:, 1:]
         pm = msk[:, 1:].float()
@@ -266,8 +304,69 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
             lg.reshape(-1, lg.size(-1)), tgt.reshape(-1),
             ignore_index=PAD, reduction="none",
         ).reshape(ids.size(0), -1)
-        loss = (ce * pm).sum() / pm.sum().clamp(min=1.0)
-        loss.backward()
+        ce_loss = (ce * pm).sum() / pm.sum().clamp(min=1.0)
+
+        # 更新基线 CE（使用 EMA）
+        if baseline_ce_tensor is None:
+            baseline_ce_tensor = ce_loss.detach().clone()
+        else:
+            baseline_ce_tensor = 0.95 * baseline_ce_tensor + 0.05 * ce_loss.detach()
+
+        total_loss = ce_loss
+
+        # --- Controller TF surrogate 损失 ---
+        # 获取 controller 的 raw logit
+        tf_raw = out.get("ctrl_tf_raw_logit", None)
+        if tf_raw is not None and use_metacog and isinstance(tf_raw, torch.Tensor):
+            # 跟踪 controller 输出历史
+            ctrl_history.append(float(tf_raw.mean().detach().cpu()))
+            if len(ctrl_history) > 100:
+                ctrl_history.pop(0)
+            
+            # ce_diff = ce_loss - baseline: 正值表示比基线差，需要 tf 增大
+            ce_diff = ce_loss - baseline_ce_tensor
+            
+            # 使用更激进的 sign 函数：
+            # soft_sign = x / (|x| + eps) 在 |x| > 0.1 时接近 sign
+            # 但我们需要一个在 0 附近也有信号的版本
+            # 使用：sign_coef = ce_diff / (|ce_diff| + 0.5)
+            eps = 0.5
+            sign_coef = ce_diff / (ce_diff.abs() + eps)
+            
+            # 核心损失：让 tf_raw 朝着正确的方向移动
+            # 如果 ce > baseline（差）：sign_coef > 0 → loss_tf = -sign * tf → tf ↑ 时 loss ↓ → 推 tf ↑
+            # 如果 ce < baseline（好）：sign_coef < 0 → loss_tf = -sign * tf → tf ↓ 时 loss ↓ → 推 tf ↓
+            tf_mean = tf_raw.mean()
+            loss_tf = -sign_coef * tf_mean
+            total_loss = total_loss + lambda_tf * loss_tf
+
+            # 熵正则：鼓励 controller 产生不同的输出
+            # 使用 sigmoid 概率的二元熵
+            tf_prob = torch.sigmoid(tf_raw)
+            entropy = -(tf_prob * torch.log(tf_prob + 1e-8) + (1 - tf_prob) * torch.log(1 - tf_prob + 1e-8))
+            loss_entropy = entropy.mean()
+            total_loss = total_loss + lambda_entropy * loss_entropy
+
+            # 弱 L2 去饱和：tf_raw 不要太大
+            loss_tf_l2 = tf_raw.pow(2).mean()
+            total_loss = total_loss + lambda_l2 * loss_tf_l2
+
+        # --- L1 Gate 训练损失 ---
+        # L1 Gate 应该学会：当 CE 损失高时输出更高的 dilemma_score，当 CE 损失低时输出更低的 score
+        dilemma_score = out.get("last_dilemma_score", None)
+        if dilemma_score is not None and use_metacog and variant_mode == "conditional":
+            lambda_gate = 2.0  # 进一步增大 L1 Gate 损失的权重
+            if isinstance(dilemma_score, torch.Tensor) and baseline_ce_tensor is not None:
+                ce_diff = ce_loss.detach() - baseline_ce_tensor.detach()
+                # 让 gate_score 跟随 ce_diff 变化
+                # 如果 ce_diff > 0（当前比基线差），应该增加 gate_score
+                # 如果 ce_diff < 0（当前比基线好），应该减少 gate_score
+                # 目标是让 gate_score 能够在 0.10-0.25 之间波动
+                target_center = 0.175  # 阈值中间值
+                loss_gate = ce_diff * (dilemma_score.mean() - target_center)
+                total_loss = total_loss + lambda_gate * loss_gate
+
+        total_loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if steps > 1:
@@ -279,7 +378,7 @@ def run_variant(name, variant_mode, cfg_kwargs, tr_dl, va_dl, device, steps=500,
             )
             cur_mode = out.get("mode", "plain")
             print(" {:6d} {:10.4f} {:10.2f} {:10.4f} {:>10} {:10d} {:9.1f}% {:10.4f} {:10.4f}".format(
-                s + 1, float(loss.item()), vppl, vloss, cur_mode, sw, pp * 100.0, score_m, ctrl_std
+                s + 1, float(total_loss.item()), vppl, vloss, cur_mode, sw, pp * 100.0, score_m, ctrl_std
             ), flush=True)
 
     final_vloss, final_vppl, final_sw, final_pp, final_score_mean, final_ctrl_std = validate_ppl(
@@ -314,6 +413,7 @@ def parse_args():
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--seq", type=int, default=64)
     p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--hf", action="store_true", help="use HuggingFace tokenizer (GPT2)")
     return p.parse_args()
 
 
@@ -333,14 +433,33 @@ def main():
     device = pick_device()
     dev_repr = str(device)
 
-    tok = ByteTokenizer(max_len=seq)
-
     pin = False
     num_work = 0
 
+    # 根据参数选择使用 ByteTokenizer 还是 HuggingFace tokenizer
+    if args.hf:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained("gpt2")
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+            tok.pad_token_id = tok.eos_token_id
+        vocab_size = tok.vocab_size
+        print(f"  [INFO] Using HuggingFace GPT2 tokenizer: vocab_size={vocab_size}")
+    else:
+        tok = ByteTokenizer(max_len=seq)
+        vocab_size = VOCAB
+
     all_texts = build_texts(n=1200, seed=42)
-    tr_ds = ByteDataset(all_texts[:900], tok, seq)
-    va_ds = ByteDataset(all_texts[900 : 900 + val_n], tok, seq)
+    
+    # 根据 tokenizer 类型选择数据集
+    if args.hf:
+        from data.hf_dataset import HFDataset
+        tr_ds = HFDataset(tok, all_texts[:900], max_length=seq)
+        va_ds = HFDataset(tok, all_texts[900 : 900 + val_n], max_length=seq)
+    else:
+        tr_ds = ByteDataset(all_texts[:900], tok, seq)
+        va_ds = ByteDataset(all_texts[900 : 900 + val_n], tok, seq)
+    
     tr_dl = DataLoader(tr_ds, batch_size=batch, shuffle=True, collate_fn=collate,
                        num_workers=num_work, pin_memory=pin, persistent_workers=False)
     va_dl = DataLoader(va_ds, batch_size=batch, shuffle=False, collate_fn=collate,
@@ -360,6 +479,7 @@ def main():
     print("=" * 92, flush=True)
 
     cfg_kwargs = dict(
+        vocab_size=vocab_size,
         d_model=d_model, d_meta=d_meta, d_aware=d_aware,
         layers=layers, heads=heads, d_ffn=d_ffn, seq=seq,
     )

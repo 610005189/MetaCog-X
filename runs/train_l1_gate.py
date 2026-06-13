@@ -14,7 +14,7 @@
 输出: train acc / val acc / val F1 / pos_score_mean / neg_score_mean
 """
 
-import sys, os, math, random, argparse
+import sys, os, math, random, argparse, numpy as np
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -533,6 +533,41 @@ def main():
     print("\n[Step 4] Saving trained gate parameters ...")
     gate.eval()
     
+    # 先评估模型获取指标
+    def final_eval(feats, labels):
+        gate.eval()
+        with torch.no_grad():
+            logits = gate(feats)
+            probs = torch.sigmoid(logits).cpu().numpy()
+        y_true = labels.cpu().numpy()
+        best_f1 = 0.0
+        best_th = 0.5
+        for th in np.arange(0.1, 0.9, 0.01):
+            y_pred = (probs >= th).astype(int)
+            tp = ((y_pred == 1) & (y_true == 1)).sum()
+            fp = ((y_pred == 1) & (y_true == 0)).sum()
+            fn = ((y_pred == 0) & (y_true == 1)).sum()
+            p = tp / max(1, tp + fp)
+            r = tp / max(1, tp + fn)
+            f1 = 2 * p * r / max(1, p + r)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_th = th
+        y_pred = (probs >= best_th).astype(int)
+        acc = (y_pred == y_true).mean()
+        pos_s = probs[y_true == 1]
+        neg_s = probs[y_true == 0]
+        pm = float(np.mean(pos_s)) if len(pos_s) else 0.0
+        nm = float(np.mean(neg_s)) if len(neg_s) else 0.0
+        return {
+            "th_best": best_th, "f1_best": best_f1,
+            "acc_best": acc, "p_best": tp / max(1, tp + fp), "r_best": tp / max(1, tp + fn),
+            "pos_mean": pm, "neg_mean": nm, "probs": probs,
+        }
+    
+    tr_res = final_eval(feats_tr_d, labs_tr_d)
+    va_res = final_eval(feats_va_d, labs_va_d)
+    
     # 保存完整检查点：门控权重 + 特征标准化参数 + 最优阈值
     checkpoint = {
         'state_dict': best_ckpt if best_ckpt else gate.state_dict(),
@@ -562,43 +597,7 @@ def main():
     print(f"  saved to: {ckpt_path}")
     
     # ---------- 最终汇总 ----------
-    def final_eval(X, y_true):
-        with torch.no_grad():
-            logits = gate(X)
-        probs = torch.sigmoid(logits)
-        th_best = 0.5; f1_best = -1.0
-        for tt in torch.linspace(0.1, 0.95, 86):
-            preds = (probs >= tt.item()).float()
-            try:
-                _, _, ff1, _ = precision_recall_fscore_support(
-                    y_true.cpu().numpy(), preds.cpu().numpy(),
-                    average="binary", zero_division=0,
-                )
-            except Exception:
-                ff1 = 0.0
-            if ff1 > f1_best:
-                f1_best = ff1; th_best = tt.item()
-        preds_at_best = (probs >= th_best).float()
-        try:
-            acc_b = float((preds_at_best == y_true).float().mean().item())
-            p_b, r_b, f1_b, _ = precision_recall_fscore_support(
-                y_true.cpu().numpy(), preds_at_best.cpu().numpy(),
-                average="binary", zero_division=0,
-            )
-        except Exception:
-            acc_b = 0.0; p_b = r_b = f1_b = 0.0
-        pos_s = probs[y_true == 1]
-        neg_s = probs[y_true == 0]
-        pm = float(pos_s.mean().item()) if pos_s.numel() else 0.0
-        nm = float(neg_s.mean().item()) if neg_s.numel() else 0.0
-        return {
-            "th_best": th_best, "f1_best": f1_best,
-            "acc_best": acc_b, "p_best": p_b, "r_best": r_b,
-            "pos_mean": pm, "neg_mean": nm, "probs": probs,
-        }
-
-    tr_res = final_eval(feats_tr_d, labs_tr_d)
-    va_res = final_eval(feats_va_d, labs_va_d)
+    # tr_res and va_res were already computed above
     
     # 计算建议的自适应阈值
     suggested_enter = checkpoint['suggested_enter_thresh']

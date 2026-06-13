@@ -54,3 +54,58 @@ class MetaCogXConfig:
         if self.d_model % self.num_heads != 0:
             raise ValueError(f"d_model ({self.d_model}) 必须能被 num_heads ({self.num_heads}) 整除")
         self.d_head = self.d_model // self.num_heads
+
+    @classmethod
+    def tiny(cls):
+        """小型配置 (d_model=128) - 用于快速测试和验证"""
+        return cls(
+            d_model=128,
+            d_meta=16,
+            d_aware=8,
+            num_layers=4,
+            num_heads=4,
+            d_ffn=512,
+            max_seq_len=512
+        )
+
+    @classmethod
+    def small(cls):
+        """小型配置 (d_model=256) - 中等规模验证"""
+        return cls(
+            d_model=256,
+            d_meta=24,
+            d_aware=12,
+            num_layers=8,
+            num_heads=8,
+            d_ffn=1024,
+            max_seq_len=1024
+        )
+
+    @classmethod
+    def medium(cls):
+        """中等配置 (d_model=512) - 规模化验证"""
+        return cls(
+            d_model=512,
+            d_meta=32,
+            d_aware=16,
+            num_layers=12,
+            num_heads=8,
+            d_ffn=2048,
+            max_seq_len=2048
+        )
+
+    @classmethod
+    def large(cls):
+        """大型配置 (d_model=1024) - 大规模训练"""
+        return cls(
+            d_model=1024,
+            d_meta=64,
+            d_aware=32,
+            num_layers=16,
+            num_heads=16,
+            d_ffn=4096,
+            max_seq_len=2048
+        )
+
+    def __str__(self):
+        return f"MetaCogXConfig(d_model={self.d_model}, num_layers={self.num_layers}, num_heads={self.num_heads})"

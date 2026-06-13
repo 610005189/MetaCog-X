@@ -135,6 +135,7 @@ class MetaCogXModel(nn.Module):
                 hidden_dim=32,
                 dropout=0.1,
             )
+            # 偏置初始化由训练脚本控制（run_ab_v2.py conditional 模式会覆盖）
             self._mode_state = 'plain'  # 'plain' | 'metacog'
             self._plain_countdown = 0
             self._meta_countdown = 0
