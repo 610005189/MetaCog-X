@@ -5,11 +5,13 @@
 2. 模仿学习训练
 3. 开悟策略优化
 """
+import hashlib
+import random
+
 import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
-import random
 
 
 @dataclass
@@ -251,9 +253,11 @@ class ImitationLearning:
         # 创建目标标签张量
         target = torch.tensor([1.0 if enlightenment_triggered else 0.0], device=device)
         
-        # 从问题中提取特征 - 使用问题文本的哈希编码作为特征
-        # 这样模型可以学习到问题特征与触发决策之间的关联
-        problem_hash = hash(problem) % 10000
+        # 从问题中提取特征 - 使用MD5哈希编码作为特征（跨会话稳定）
+        # Python内置hash()在3.3+版本中是随机化的，不适合用于学习
+        # 使用errors='replace'处理非UTF-8字符
+        problem_bytes = problem.encode('utf-8', errors='replace')
+        problem_hash = int(hashlib.md5(problem_bytes).hexdigest(), 16) % 10000
         problem_seed = torch.tensor([problem_hash / 10000.0], device=device)  # 归一化到[0,1]
         problem_features = problem_seed.unsqueeze(0)  # [1, 1]
         
