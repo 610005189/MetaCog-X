@@ -186,14 +186,12 @@ class CognitiveParticle(nn.Module):
         self.aware_scale = nn.Parameter(torch.ones(1))
 
         # 正交性损失模块 - 始终创建，未启用时设为None
-        self.enable_orthogonality = enable_orthogonality
         if enable_orthogonality:
             self.ortho_loss = OrthogonalityLoss(lambda_ortho=1.0, lambda_norm=0.1)
         else:
             self.ortho_loss = None
 
         # 动态缩放控制器 - 始终创建，未启用时设为None
-        self.enable_dynamic_scaling = enable_dynamic_scaling
         if enable_dynamic_scaling:
             self.scaling_controller = DynamicScalingController(
                 base_dims={"content": d_model, "meta": d_meta, "awareness": d_aware}

@@ -179,11 +179,15 @@ class ImitationLearning:
         # 专家演示数据（人工标注或规则生成）
         self.expert_demos: List[Dict] = []
 
+        # 预定义触发预测器 - 在__init__中定义以确保正确注册到nn.Module
+        self.trigger_predictor = nn.Linear(1, 1)  # 输入为归一化的问题哈希特征
+
         # 优化器
         self.optimizer = torch.optim.AdamW([
             {"params": model.parameters(), "lr": lr * 0.1},
             {"params": controller.parameters(), "lr": lr},
-            {"params": self.trigger.parameters(), "lr": lr}
+            {"params": self.trigger.parameters(), "lr": lr},
+            {"params": self.trigger_predictor.parameters(), "lr": lr}
         ])
 
     def add_expert_demo(
@@ -244,23 +248,23 @@ class ImitationLearning:
         # 专家演示表示"应该触发"或"不应该触发"
         # 需要基于模型实际的触发输出与专家标签计算损失
         
-        # 创建目标标签张量 - 保持与prediction_prob相同的维度
-        target = torch.tensor([[1.0 if enlightenment_triggered else 0.0]], device=device)  # [1, 1]
+        # 创建目标标签张量
+        target = torch.tensor([1.0 if enlightenment_triggered else 0.0], device=device)
         
-        # 模拟模型预测（实际应该从模型获取触发概率）
-        # 这里使用一个可学习的预测参数来模拟模型输出
-        if not hasattr(self, 'trigger_predictor'):
-            self.trigger_predictor = nn.Linear(1, 1).to(device)
+        # 从问题中提取特征 - 使用问题文本的哈希编码作为特征
+        # 这样模型可以学习到问题特征与触发决策之间的关联
+        problem_hash = hash(problem) % 10000
+        problem_seed = torch.tensor([problem_hash / 10000.0], device=device)  # 归一化到[0,1]
+        problem_features = problem_seed.unsqueeze(0)  # [1, 1]
         
-        # 使用问题特征作为输入（简化：使用固定特征）
-        dummy_input = torch.ones(1, 1, device=device)
-        prediction = self.trigger_predictor(dummy_input)  # [1, 1]
-        prediction_prob = torch.sigmoid(prediction)  # [1, 1]
+        # 使用实际问题特征作为输入预测触发概率
+        prediction = self.trigger_predictor(problem_features)  # [1, 1]
+        prediction_prob = torch.sigmoid(prediction)  # 保持[1, 1]维度
         
         # 计算二元交叉熵损失 - 确保维度匹配
         bce_loss = torch.nn.functional.binary_cross_entropy(
             prediction_prob,  # [1, 1]
-            target,  # [1, 1]
+            target.unsqueeze(0),  # [1, 1]
             reduction='mean'
         )
         
