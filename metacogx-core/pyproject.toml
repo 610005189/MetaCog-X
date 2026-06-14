@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metacogx-core"
+version = "0.1.0"
+description = "MetaCog-X Core: Dilemma Detection and Intervention Framework"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "MetaCog-X Team"}
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["metacogx_core*"]

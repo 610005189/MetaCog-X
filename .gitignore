@@ -51,3 +51,31 @@ Thumbs.db
 .env.local
 venv/
 .env/
+
+# VSCode Extension
+vscode-extension/node_modules/
+vscode-extension/dist/
+vscode-extension/*.vsix
+vscode-extension/*.log
+
+# Python Package
+metacogx-core/__pycache__/
+metacogx-core/*.egg-info/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Lock files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
