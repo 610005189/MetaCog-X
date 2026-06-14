@@ -6,7 +6,7 @@ from .signals import DilemmaSignal, DilemmaType
 from .thresholds import DEFAULT_THRESHOLDS
 from .utils import (
     compute_token_repetition,
-    compute_logists_entropy,
+    compute_logits_entropy,
     compute_ngram_repetition,
     detect_consecutive_same,
     current_timestamp,
@@ -68,7 +68,7 @@ class DilemmaDetector:
 
         # 2. Logits 熵
         if logits is not None:
-            features["logits_entropy"] = compute_logists_entropy(logits)
+            features["logits_entropy"] = compute_logits_entropy(logits)
         else:
             features["logits_entropy"] = 0.0
 

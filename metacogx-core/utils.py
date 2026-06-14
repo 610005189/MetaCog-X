@@ -30,7 +30,7 @@ def compute_token_repetition(tokens: Union[List[int], np.ndarray], window: int =
     return repetition_count / total_comparisons if total_comparisons > 0 else 0.0
 
 
-def compute_logists_entropy(logits: np.ndarray) -> float:
+def compute_logits_entropy(logits: np.ndarray) -> float:
     """计算 logits 分布的熵
 
     Args:

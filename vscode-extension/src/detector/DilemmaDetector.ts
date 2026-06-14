@@ -31,17 +31,21 @@ export class DilemmaDetector {
             return result;
         }
 
-        const entropy = logits.length > 0 ? this.computeLogitsEntropy(logits) : 0;
-        if (entropy > this.thresholds.logitsEntropy) {
-            const result = this.buildResult(DilemmaType.SYNTAX_ANOMALY, tokenRep, entropy, 0, consecutive);
+        const ngramRep = this.computeNgramRepetition(tokens);
+        if (ngramRep > this.thresholds.ngramRepetition) {
+            const result = this.buildResult(DilemmaType.PATTERN_REPEAT, tokenRep, 0, ngramRep, consecutive);
             this.addToCache(cacheKey, result);
             return result;
         }
 
-        const ngramRep = this.computeNgramRepetition(tokens);
-        const type = ngramRep > this.thresholds.ngramRepetition ? DilemmaType.PATTERN_REPEAT : DilemmaType.SEMANTIC_STUCK;
-        
-        const result = this.buildResult(type, tokenRep, entropy, ngramRep, consecutive);
+        const entropy = logits.length > 0 ? this.computeLogitsEntropy(logits) : 0;
+        if (entropy > this.thresholds.logitsEntropy) {
+            const result = this.buildResult(DilemmaType.SYNTAX_ANOMALY, tokenRep, entropy, ngramRep, consecutive);
+            this.addToCache(cacheKey, result);
+            return result;
+        }
+
+        const result = this.buildResult(DilemmaType.NONE, tokenRep, entropy, ngramRep, consecutive);
         this.addToCache(cacheKey, result);
         return result;
     }
@@ -70,17 +74,25 @@ export class DilemmaDetector {
         this.cache.set(key, value);
     }
 
-    private computeTokenRepetition(tokens: number[]): number {
-        const window = 5;
+    private computeTokenRepetition(tokens: number[], window: number = 5): number {
         const len = tokens.length;
-        if (len <= window) return 0;
-        
-        let repeats = 0;
-        const maxIdx = len - window;
-        for (let i = 0; i < maxIdx; i++) {
-            if (tokens[i] === tokens[i + 1]) repeats++;
+        if (len < 2) return 0.0;
+
+        const w = Math.min(window, len);
+        let repetitionCount = 0;
+        let totalComparisons = 0;
+
+        for (let shift = 1; shift < w; shift++) {
+            const maxIdx = len - shift;
+            for (let i = 0; i < maxIdx; i++) {
+                if (tokens[i] === tokens[i + shift]) {
+                    repetitionCount++;
+                }
+                totalComparisons++;
+            }
         }
-        return repeats / maxIdx;
+
+        return totalComparisons > 0 ? repetitionCount / totalComparisons : 0.0;
     }
 
     private computeLogitsEntropy(logits: number[][]): number {
@@ -119,21 +131,18 @@ export class DilemmaDetector {
 
     private computeNgramRepetition(tokens: number[], n: number = 3): number {
         const len = tokens.length;
-        if (len <= n) return 0;
+        if (len < n * 2) return 0.0;
 
         const ngramCount = new Map<number, number>();
-        const maxIdx = len - n;
+        const maxIdx = len - n + 1;
         
         for (let i = 0; i < maxIdx; i++) {
             const hash = this.hashNgram(tokens, i, n);
             ngramCount.set(hash, (ngramCount.get(hash) || 0) + 1);
         }
 
-        let repeats = 0;
-        for (const count of ngramCount.values()) {
-            if (count > 1) repeats++;
-        }
-        return repeats / maxIdx;
+        const uniqueNgrams = ngramCount.size;
+        return maxIdx > 0 ? 1.0 - (uniqueNgrams / maxIdx) : 0.0;
     }
 
     private hashNgram(tokens: number[], start: number, n: number): number {
@@ -172,6 +181,8 @@ export class DilemmaDetector {
                 return Math.min(entropy / (this.thresholds.logitsEntropy * 2), 1);
             case DilemmaType.PATTERN_REPEAT:
                 return Math.min(ngramRep / (this.thresholds.ngramRepetition * 2), 1);
+            case DilemmaType.NONE:
+                return 0;
             default:
                 return 0;
         }
